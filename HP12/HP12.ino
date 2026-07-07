@@ -11,7 +11,7 @@
 #include <Adafruit_SSD1306.h>
 
 // ============================================================================
-// HP12 v1.6.0
+// HP12 v1.7.1
 // Clean UI + line gauge + advice button.
 // This code is intentionally verbose and commented for future maintenance.
 // ============================================================================
@@ -75,6 +75,23 @@
 
 #ifndef MQTT_CLIENT_ID_PREFIX
 #define MQTT_CLIENT_ID_PREFIX "HP12_"
+#endif
+
+
+#ifndef RPC_ENABLED
+#define RPC_ENABLED 1
+#endif
+
+#ifndef RPC_RESTART_DELAY_MS
+#define RPC_RESTART_DELAY_MS 1200UL
+#endif
+
+#ifndef TELEMETRY_INTERVAL_MIN_MS
+#define TELEMETRY_INTERVAL_MIN_MS 15000UL
+#endif
+
+#ifndef TELEMETRY_INTERVAL_MAX_MS
+#define TELEMETRY_INTERVAL_MAX_MS 600000UL
 #endif
 
 
@@ -242,6 +259,15 @@ unsigned long lastAttributesMs = 0;
 bool forceFirstTelemetry = true;
 bool attributesSentOnce = false;
 bool cloudEverConnected = false;
+
+unsigned long telemetryIntervalMs = TELEMETRY_INTERVAL_MS;
+unsigned long scheduledRestartMs = 0;
+
+String lastRpcMethod = "none";
+String lastRpcResult = "none";
+unsigned long lastRpcAtMs = 0;
+
+bool rpcSubscribed = false;
 
 // =========================
 // BASIC IO HELPERS
@@ -1468,6 +1494,10 @@ void updateBlueLedNonBlocking() {
 // - Anti-spam: gui telemetry theo TELEMETRY_INTERVAL_MS.
 // - Force first sync: gui ngay 1 goi dau tien khi MQTT ket noi.
 
+void onMqttMessage(char* topic, byte* payload, unsigned int length);
+void subscribeRpc();
+void updateScheduledRestartNonBlocking();
+
 const char* resetReasonText(esp_reset_reason_t reason) {
   switch (reason) {
     case ESP_RST_POWERON:  return "POWERON";
@@ -1570,6 +1600,8 @@ void sendDeviceAttributes() {
   jsonAddInt(payload, first, "dhtPin", DHT_PIN);
   jsonAddInt(payload, first, "lightAoPin", LIGHT_AO_PIN);
   jsonAddInt(payload, first, "oledSafeWidth", OLED_SAFE_W);
+  jsonAddBool(payload, first, "rpcEnabled", RPC_ENABLED);
+  jsonAddString(payload, first, "rpcMethods", "getStatus,getTelemetry,muteAlarm,setAlarmProfile,setTelemetryInterval,restart,updateFirmware");
 
   payload += "}";
 
@@ -1579,9 +1611,15 @@ void sendDeviceAttributes() {
 }
 
 void updateMqttNonBlocking() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    rpcSubscribed = false;
+    return;
+  }
 
   if (mqttClient.connected()) return;
+
+  // Neu MQTT da rot ket noi, danh dau RPC chua san sang.
+  rpcSubscribed = false;
 
   unsigned long now = millis();
   if (now - lastMqttRetryMs < MQTT_RETRY_INTERVAL_MS) return;
@@ -1593,7 +1631,9 @@ void updateMqttNonBlocking() {
   Serial.print("[MQTT] Connecting to ");
   Serial.print(TB_HOST);
   Serial.print(":");
-  Serial.println(TB_PORT);
+  Serial.print(TB_PORT);
+  Serial.print(" | RSSI=");
+  Serial.println(WiFi.RSSI());
 
   bool connected = mqttClient.connect(clientId.c_str(), TB_TOKEN, NULL);
 
@@ -1604,6 +1644,11 @@ void updateMqttNonBlocking() {
     forceFirstTelemetry = FORCE_FIRST_SYNC_ENABLED;
     attributesSentOnce = false;
     lastAttributesMs = 0;
+
+    // v1.7.1 FIX:
+    // v1.7.0 thieu lenh subscribeRpc() sau khi reconnect,
+    // nen device online nhung khong nhan duoc RPC.
+    subscribeRpc();
 
     sendDeviceAttributes();
     attributesSentOnce = true;
@@ -1639,6 +1684,12 @@ String buildTelemetryPayload() {
   jsonAddBool(payload, first, "alarmMuted", alarmIsMuted());
   jsonAddBool(payload, first, "sensorValid", sensorHasValidData);
   jsonAddBool(payload, first, "lastSensorReadOk", lastSensorReadOk);
+  jsonAddBool(payload, first, "rpcReady", mqttClient.connected() && rpcSubscribed);
+  jsonAddString(payload, first, "lastRpcMethod", lastRpcMethod.c_str());
+  jsonAddString(payload, first, "lastRpcResult", lastRpcResult.c_str());
+  jsonAddInt(payload, first, "lastRpcAtSec", lastRpcAtMs / 1000);
+  jsonAddInt(payload, first, "telemetryIntervalMs", telemetryIntervalMs);
+
   jsonAddBool(payload, first, "mqttConnected", mqttClient.connected());
 
   jsonAddInt(payload, first, "uptimeSec", millis() / 1000);
@@ -1668,6 +1719,320 @@ void sendTelemetryNow(const char* reason) {
   }
 }
 
+
+// =========================
+// RPC CONTROL
+// =========================
+//
+// ThingsBoard RPC topic:
+//   request : v1/devices/me/rpc/request/+
+//   response: v1/devices/me/rpc/response/<requestId>
+//
+// Parser duoc viet toi gian de khong can them ArduinoJson.
+// Cac RPC method ho tro o v1.7.0:
+// - getStatus
+// - getTelemetry
+// - muteAlarm
+// - setAlarmProfile
+// - setTelemetryInterval
+// - restart
+// - updateFirmware: chi tra loi "OTA chua bat", OTA lam o v1.8.0
+
+void markRpcResult(const char* method, const char* result) {
+  lastRpcMethod = method;
+  lastRpcResult = result;
+  lastRpcAtMs = millis();
+}
+
+String extractRpcRequestId(const String &topic) {
+  int slash = topic.lastIndexOf('/');
+  if (slash < 0 || slash >= (int)topic.length() - 1) return "0";
+  return topic.substring(slash + 1);
+}
+
+String extractJsonStringValue(const String &json, const char* key) {
+  String pattern = "\"";
+  pattern += key;
+  pattern += "\"";
+
+  int keyPos = json.indexOf(pattern);
+  if (keyPos < 0) return "";
+
+  int colonPos = json.indexOf(':', keyPos);
+  if (colonPos < 0) return "";
+
+  int quote1 = json.indexOf('"', colonPos + 1);
+  if (quote1 < 0) return "";
+
+  int quote2 = json.indexOf('"', quote1 + 1);
+  if (quote2 < 0) return "";
+
+  return json.substring(quote1 + 1, quote2);
+}
+
+String extractRpcParamsRaw(const String &json) {
+  int keyPos = json.indexOf("\"params\"");
+  if (keyPos < 0) return "";
+
+  int colonPos = json.indexOf(':', keyPos);
+  if (colonPos < 0) return "";
+
+  String params = json.substring(colonPos + 1);
+  params.trim();
+
+  if (params.endsWith("}")) {
+    params.remove(params.length() - 1);
+    params.trim();
+  }
+
+  return params;
+}
+
+long extractFirstNumber(const String &text, long fallbackValue) {
+  String digits = "";
+  bool started = false;
+
+  for (int i = 0; i < (int)text.length(); i++) {
+    char c = text.charAt(i);
+
+    if ((c >= '0' && c <= '9') || (c == '-' && !started)) {
+      digits += c;
+      started = true;
+    } else if (started) {
+      break;
+    }
+  }
+
+  if (digits.length() == 0) return fallbackValue;
+  return digits.toInt();
+}
+
+void sendRpcResponse(const String &requestId, const String &responsePayload) {
+  if (!mqttClient.connected()) return;
+
+  String responseTopic = "v1/devices/me/rpc/response/";
+  responseTopic += requestId;
+
+  bool ok = mqttClient.publish(responseTopic.c_str(), responsePayload.c_str());
+
+  Serial.print("[RPC] Response ");
+  Serial.print(requestId);
+  Serial.print(" ");
+  Serial.println(ok ? "sent." : "failed.");
+}
+
+String buildStatusPayload() {
+  String payload = "{";
+  bool first = true;
+
+  jsonAddBool(payload, first, "success", true);
+  jsonAddString(payload, first, "deviceName", DEVICE_NAME);
+  jsonAddString(payload, first, "firmwareVersion", FIRMWARE_VERSION);
+  jsonAddString(payload, first, "state", getStateCode());
+  jsonAddString(payload, first, "stateText", getStateText());
+  jsonAddString(payload, first, "action", getShortActionText());
+
+  jsonAddFloat(payload, first, "temperature", tempC, 2, sensorHasValidData);
+  jsonAddFloat(payload, first, "humidity", humidity, 2, sensorHasValidData);
+  jsonAddFloat(payload, first, "heatIndex", heatIndexC, 2, sensorHasValidData);
+#if LIGHT_SENSOR_ENABLED
+  jsonAddFloat(payload, first, "lightPercent", lightPercent, 1, lightReady && !isnan(lightPercent));
+#endif
+  jsonAddFloat(payload, first, "focusScore", focusScore, 1, sensorHasValidData);
+
+  jsonAddBool(payload, first, "alarmMuted", alarmIsMuted());
+  jsonAddString(payload, first, "alarmProfile", getAlarmProfileText());
+  jsonAddInt(payload, first, "telemetryIntervalMs", telemetryIntervalMs);
+  jsonAddInt(payload, first, "uptimeSec", millis() / 1000);
+  jsonAddInt(payload, first, "wifiRssi", WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -999);
+  jsonAddInt(payload, first, "freeHeap", ESP.getFreeHeap());
+
+  payload += "}";
+  return payload;
+}
+
+void handleRpcGetStatus(const String &requestId) {
+  markRpcResult("getStatus", "ok");
+  sendRpcResponse(requestId, buildStatusPayload());
+}
+
+void handleRpcGetTelemetry(const String &requestId) {
+  sendTelemetryNow("rpc-getTelemetry");
+  markRpcResult("getTelemetry", "sent");
+  sendRpcResponse(requestId, "{\"success\":true,\"message\":\"telemetry sent\"}");
+}
+
+void handleRpcRestart(const String &requestId) {
+  markRpcResult("restart", "scheduled");
+  sendRpcResponse(requestId, "{\"success\":true,\"message\":\"restart scheduled\"}");
+  scheduledRestartMs = millis() + RPC_RESTART_DELAY_MS;
+}
+
+void handleRpcMuteAlarm(const String &requestId, const String &paramsRaw) {
+  String p = paramsRaw;
+  p.toLowerCase();
+
+  if (p.indexOf("false") >= 0 || p.indexOf("unmute") >= 0 || p.indexOf("off") >= 0 || p == "0") {
+    alarmMutedUntilMs = 0;
+    markRpcResult("muteAlarm", "unmuted");
+    sendRpcResponse(requestId, "{\"success\":true,\"alarmMuted\":false}");
+    return;
+  }
+
+  if (p.indexOf("true") >= 0 || p.indexOf("mute") >= 0 || p.indexOf("on") >= 0 || p == "1") {
+    alarmMutedUntilMs = millis() + ALARM_MUTE_MS;
+    markRpcResult("muteAlarm", "muted");
+    sendRpcResponse(requestId, "{\"success\":true,\"alarmMuted\":true}");
+    return;
+  }
+
+  // Neu params rong/khong ro: toggle.
+  if (alarmIsMuted()) {
+    alarmMutedUntilMs = 0;
+    markRpcResult("muteAlarm", "toggle-unmuted");
+    sendRpcResponse(requestId, "{\"success\":true,\"alarmMuted\":false}");
+  } else {
+    alarmMutedUntilMs = millis() + ALARM_MUTE_MS;
+    markRpcResult("muteAlarm", "toggle-muted");
+    sendRpcResponse(requestId, "{\"success\":true,\"alarmMuted\":true}");
+  }
+}
+
+void handleRpcSetAlarmProfile(const String &requestId, const String &paramsRaw) {
+  String p = paramsRaw;
+  p.toUpperCase();
+
+  bool ok = true;
+
+  if (p.indexOf("QUIET") >= 0 || p.indexOf("IM") >= 0 || p == "0") {
+    alarmProfile = ALARM_QUIET;
+  } else if (p.indexOf("NORMAL") >= 0 || p.indexOf("VUA") >= 0 || p == "1") {
+    alarmProfile = ALARM_NORMAL;
+  } else if (p.indexOf("STRONG") >= 0 || p.indexOf("MANH") >= 0 || p == "2") {
+    alarmProfile = ALARM_STRONG;
+  } else {
+    ok = false;
+  }
+
+  if (ok) {
+    markRpcResult("setAlarmProfile", getAlarmProfileText());
+
+    String response = "{\"success\":true,\"alarmProfile\":\"";
+    response += getAlarmProfileText();
+    response += "\"}";
+    sendRpcResponse(requestId, response);
+  } else {
+    markRpcResult("setAlarmProfile", "invalid");
+    sendRpcResponse(requestId, "{\"success\":false,\"message\":\"invalid alarm profile. Use 0/1/2 or IM/VUA/MANH\"}");
+  }
+}
+
+void handleRpcSetTelemetryInterval(const String &requestId, const String &paramsRaw) {
+  long requested = extractFirstNumber(paramsRaw, TELEMETRY_INTERVAL_MS);
+
+  if (requested < (long)TELEMETRY_INTERVAL_MIN_MS) requested = TELEMETRY_INTERVAL_MIN_MS;
+  if (requested > (long)TELEMETRY_INTERVAL_MAX_MS) requested = TELEMETRY_INTERVAL_MAX_MS;
+
+  telemetryIntervalMs = (unsigned long)requested;
+
+  markRpcResult("setTelemetryInterval", "ok");
+
+  String response = "{\"success\":true,\"telemetryIntervalMs\":";
+  response += String(telemetryIntervalMs);
+  response += "}";
+  sendRpcResponse(requestId, response);
+}
+
+void handleRpcUpdateFirmware(const String &requestId) {
+  // Chua thuc hien OTA o v1.7.0.
+  // Muc tieu ban nay la xac nhan RPC on dinh truoc khi cho phep update firmware tu xa.
+  markRpcResult("updateFirmware", "ota-not-enabled");
+  sendRpcResponse(requestId, "{\"success\":false,\"message\":\"OTA is not enabled in v1.7.1. Planned for v1.8.0\"}");
+}
+
+void handleRpcRequest(const String &requestId, const String &method, const String &paramsRaw) {
+  Serial.print("[RPC] Method=");
+  Serial.print(method);
+  Serial.print(" Params=");
+  Serial.println(paramsRaw);
+
+  if (method == "getStatus") {
+    handleRpcGetStatus(requestId);
+  } else if (method == "getTelemetry") {
+    handleRpcGetTelemetry(requestId);
+  } else if (method == "restart") {
+    handleRpcRestart(requestId);
+  } else if (method == "muteAlarm") {
+    handleRpcMuteAlarm(requestId, paramsRaw);
+  } else if (method == "setAlarmProfile") {
+    handleRpcSetAlarmProfile(requestId, paramsRaw);
+  } else if (method == "setTelemetryInterval") {
+    handleRpcSetTelemetryInterval(requestId, paramsRaw);
+  } else if (method == "updateFirmware") {
+    handleRpcUpdateFirmware(requestId);
+  } else {
+    markRpcResult(method.c_str(), "unknown-method");
+
+    String response = "{\"success\":false,\"message\":\"unknown RPC method: ";
+    response += jsonEscape(method.c_str());
+    response += "\"}";
+    sendRpcResponse(requestId, response);
+  }
+}
+
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+#if RPC_ENABLED
+  String topicStr = String(topic);
+  String requestId = extractRpcRequestId(topicStr);
+
+  String body = "";
+  for (unsigned int i = 0; i < length; i++) {
+    body += (char)payload[i];
+  }
+
+  String method = extractJsonStringValue(body, "method");
+  String paramsRaw = extractRpcParamsRaw(body);
+
+  if (method.length() == 0) {
+    markRpcResult("unknown", "bad-payload");
+    sendRpcResponse(requestId, "{\"success\":false,\"message\":\"missing method\"}");
+    return;
+  }
+
+  handleRpcRequest(requestId, method, paramsRaw);
+#else
+  (void)topic;
+  (void)payload;
+  (void)length;
+#endif
+}
+
+void subscribeRpc() {
+#if RPC_ENABLED
+  if (!mqttClient.connected()) {
+    rpcSubscribed = false;
+    return;
+  }
+
+  bool ok = mqttClient.subscribe("v1/devices/me/rpc/request/+");
+  rpcSubscribed = ok;
+
+  Serial.print("[RPC] Subscribe ");
+  Serial.println(ok ? "ok." : "failed.");
+#endif
+}
+
+void updateScheduledRestartNonBlocking() {
+  if (scheduledRestartMs == 0) return;
+
+  if (millis() >= scheduledRestartMs) {
+    Serial.println("[SYS] Restarting by RPC...");
+    delay(50);
+    ESP.restart();
+  }
+}
+
+
 void sendTelemetryNonBlocking() {
   if (!mqttClient.connected()) return;
 
@@ -1687,7 +2052,7 @@ void sendTelemetryNonBlocking() {
     return;
   }
 
-  if (now - lastTelemetryMs < TELEMETRY_INTERVAL_MS) return;
+  if (now - lastTelemetryMs < telemetryIntervalMs) return;
 
   lastTelemetryMs = now;
   sendTelemetryNow("periodic");
@@ -1738,9 +2103,10 @@ void setup() {
   WiFi.persistent(false);
 
   mqttClient.setServer(TB_HOST, TB_PORT);
+  mqttClient.setCallback(onMqttMessage);
   mqttClient.setBufferSize(MQTT_BUFFER_SIZE);
-  mqttClient.setKeepAlive(30);
-  mqttClient.setSocketTimeout(3);
+  mqttClient.setKeepAlive(60);
+  mqttClient.setSocketTimeout(6);
 
   allOutputsOff();
 
@@ -1759,7 +2125,7 @@ void setup() {
   Serial.println("====================================");
   Serial.print("HP12 ");
   Serial.print(FIRMWARE_VERSION);
-  Serial.println(" THINGSBOARD STABLE BRIDGE started.");
+  Serial.println(" RPC CONTROL BRIDGE started.");
   Serial.print("DHT PIN: GPIO");
   Serial.println(DHT_PIN);
   Serial.print("LIGHT AO PIN: GPIO");
@@ -1789,6 +2155,7 @@ void loop() {
   updateEnvironmentLedAndBuzzerNonBlocking();
   updateBlueLedNonBlocking();
   updateCloudNonBlocking();
+  updateScheduledRestartNonBlocking();
 
   // Khong delay dai.
   // Khong while chan.

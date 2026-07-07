@@ -23,7 +23,7 @@
 
 #define DEVICE_NAME        "HP12"
 #define DEVICE_MODEL       "ESP32_HP12"
-#define FIRMWARE_VERSION   "v1.6.0"
+#define FIRMWARE_VERSION   "v1.7.1"
 
 // =========================
 // PIN CONFIG
@@ -105,7 +105,7 @@
 
 // Du phong cho giai doan ThingsBoard
 #define WIFI_RETRY_INTERVAL_MS       5000UL
-#define MQTT_RETRY_INTERVAL_MS       5000UL
+#define MQTT_RETRY_INTERVAL_MS       10000UL
 #define TELEMETRY_INTERVAL_MS        30000UL
 
 // =========================
@@ -117,7 +117,18 @@
 #define FORCE_FIRST_SYNC_ENABLED      1
 #define ATTRIBUTES_RESEND_MS          300000UL   // gui lai attributes moi 5 phut
 #define MQTT_CLIENT_ID_PREFIX         "HP12_"
-#define MQTT_BUFFER_SIZE              768
+#define MQTT_BUFFER_SIZE              1024
+
+// =========================
+// RPC CONTROL CONFIG
+// =========================
+//
+// v1.7.0 chi them RPC an toan truoc.
+// OTA firmware update se lam rieng o v1.8.0 de tranh rui ro.
+#define RPC_ENABLED                   1
+#define RPC_RESTART_DELAY_MS          1200UL
+#define TELEMETRY_INTERVAL_MIN_MS     15000UL
+#define TELEMETRY_INTERVAL_MAX_MS     600000UL
 
 // =========================
 // COMFORT THRESHOLD
