@@ -5,13 +5,16 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <esp_system.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Update.h>
 #include <Wire.h>
 #include <DHT.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
 // ============================================================================
-// HP12 v1.7.1
+// HP12 v1.8.0
 // Clean UI + line gauge + advice button.
 // This code is intentionally verbose and commented for future maintenance.
 // ============================================================================
@@ -92,6 +95,27 @@
 
 #ifndef TELEMETRY_INTERVAL_MAX_MS
 #define TELEMETRY_INTERVAL_MAX_MS 600000UL
+#endif
+
+
+#ifndef OTA_ENABLED
+#define OTA_ENABLED 1
+#endif
+
+#ifndef OTA_ALLOW_INSECURE_TLS
+#define OTA_ALLOW_INSECURE_TLS 1
+#endif
+
+#ifndef OTA_HTTP_TIMEOUT_MS
+#define OTA_HTTP_TIMEOUT_MS 20000UL
+#endif
+
+#ifndef OTA_RESTART_DELAY_MS
+#define OTA_RESTART_DELAY_MS 1200UL
+#endif
+
+#ifndef OTA_REQUIRE_HTTPS
+#define OTA_REQUIRE_HTTPS 1
 #endif
 
 
@@ -268,6 +292,22 @@ String lastRpcResult = "none";
 unsigned long lastRpcAtMs = 0;
 
 bool rpcSubscribed = false;
+
+
+// =========================
+// OTA STATE
+// =========================
+//
+// OTA khong chay truc tiep trong callback RPC.
+// RPC chi xep lenh, gui phan hoi ve ThingsBoard, sau do loop moi bat dau OTA.
+bool otaPending = false;
+bool otaInProgress = false;
+
+String otaPendingUrl = "";
+String otaTargetVersion = "";
+String otaStatus = "idle";
+String otaLastError = "";
+unsigned long otaRequestedAtMs = 0;
 
 // =========================
 // BASIC IO HELPERS
@@ -1497,6 +1537,8 @@ void updateBlueLedNonBlocking() {
 void onMqttMessage(char* topic, byte* payload, unsigned int length);
 void subscribeRpc();
 void updateScheduledRestartNonBlocking();
+void updateOtaNonBlocking();
+bool performOtaUpdate(const String &firmwareUrl);
 
 const char* resetReasonText(esp_reset_reason_t reason) {
   switch (reason) {
@@ -1602,6 +1644,8 @@ void sendDeviceAttributes() {
   jsonAddInt(payload, first, "oledSafeWidth", OLED_SAFE_W);
   jsonAddBool(payload, first, "rpcEnabled", RPC_ENABLED);
   jsonAddString(payload, first, "rpcMethods", "getStatus,getTelemetry,muteAlarm,setAlarmProfile,setTelemetryInterval,restart,updateFirmware");
+  jsonAddBool(payload, first, "otaEnabled", OTA_ENABLED);
+  jsonAddString(payload, first, "otaMode", "rpc-updateFirmware-https-url");
 
   payload += "}";
 
@@ -1689,6 +1733,12 @@ String buildTelemetryPayload() {
   jsonAddString(payload, first, "lastRpcResult", lastRpcResult.c_str());
   jsonAddInt(payload, first, "lastRpcAtSec", lastRpcAtMs / 1000);
   jsonAddInt(payload, first, "telemetryIntervalMs", telemetryIntervalMs);
+
+  jsonAddString(payload, first, "otaStatus", otaStatus.c_str());
+  jsonAddString(payload, first, "otaTargetVersion", otaTargetVersion.c_str());
+  jsonAddString(payload, first, "otaLastError", otaLastError.c_str());
+  jsonAddBool(payload, first, "otaPending", otaPending);
+  jsonAddBool(payload, first, "otaInProgress", otaInProgress);
 
   jsonAddBool(payload, first, "mqttConnected", mqttClient.connected());
 
@@ -1843,6 +1893,11 @@ String buildStatusPayload() {
   jsonAddBool(payload, first, "alarmMuted", alarmIsMuted());
   jsonAddString(payload, first, "alarmProfile", getAlarmProfileText());
   jsonAddInt(payload, first, "telemetryIntervalMs", telemetryIntervalMs);
+  jsonAddString(payload, first, "otaStatus", otaStatus.c_str());
+  jsonAddString(payload, first, "otaTargetVersion", otaTargetVersion.c_str());
+  jsonAddString(payload, first, "otaLastError", otaLastError.c_str());
+  jsonAddBool(payload, first, "otaPending", otaPending);
+  jsonAddBool(payload, first, "otaInProgress", otaInProgress);
   jsonAddInt(payload, first, "uptimeSec", millis() / 1000);
   jsonAddInt(payload, first, "wifiRssi", WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -999);
   jsonAddInt(payload, first, "freeHeap", ESP.getFreeHeap());
@@ -1943,12 +1998,92 @@ void handleRpcSetTelemetryInterval(const String &requestId, const String &params
   sendRpcResponse(requestId, response);
 }
 
-void handleRpcUpdateFirmware(const String &requestId) {
-  // Chua thuc hien OTA o v1.7.0.
-  // Muc tieu ban nay la xac nhan RPC on dinh truoc khi cho phep update firmware tu xa.
-  markRpcResult("updateFirmware", "ota-not-enabled");
-  sendRpcResponse(requestId, "{\"success\":false,\"message\":\"OTA is not enabled in v1.7.1. Planned for v1.8.0\"}");
+String normalizeOtaUrl(const String &paramsRaw) {
+  String url = extractJsonStringValue(paramsRaw, "url");
+
+  if (url.length() == 0) {
+    url = paramsRaw;
+    url.trim();
+
+    if (url.startsWith("\"") && url.endsWith("\"") && url.length() > 1) {
+      url = url.substring(1, url.length() - 1);
+    }
+  }
+
+  url.trim();
+  return url;
 }
+
+String normalizeOtaVersion(const String &paramsRaw) {
+  String version = extractJsonStringValue(paramsRaw, "version");
+  version.trim();
+  return version;
+}
+
+bool isOtaUrlAllowed(const String &url) {
+#if OTA_REQUIRE_HTTPS
+  if (!url.startsWith("https://")) return false;
+#else
+  if (!url.startsWith("http://") && !url.startsWith("https://")) return false;
+#endif
+
+  return true;
+}
+
+void setOtaError(const String &errorText) {
+  otaStatus = "error";
+  otaLastError = errorText;
+  otaPending = false;
+  otaInProgress = false;
+
+  String result = "error:";
+  result += errorText;
+  markRpcResult("updateFirmware", result.c_str());
+
+  Serial.print("[OTA] ERROR: ");
+  Serial.println(errorText);
+
+  sendTelemetryNow("ota-error");
+}
+
+void handleRpcUpdateFirmware(const String &requestId, const String &paramsRaw) {
+#if OTA_ENABLED
+  if (otaPending || otaInProgress) {
+    sendRpcResponse(requestId, "{\"success\":false,\"message\":\"OTA already pending or in progress\"}");
+    return;
+  }
+
+  String url = normalizeOtaUrl(paramsRaw);
+  String version = normalizeOtaVersion(paramsRaw);
+
+  if (url.length() == 0 || !isOtaUrlAllowed(url)) {
+    markRpcResult("updateFirmware", "bad-url");
+    sendRpcResponse(requestId, "{\"success\":false,\"message\":\"missing or invalid firmware url. Use HTTPS url\"}");
+    return;
+  }
+
+  otaPendingUrl = url;
+  otaTargetVersion = version.length() ? version : "unknown";
+  otaStatus = "queued";
+  otaLastError = "";
+  otaRequestedAtMs = millis();
+  otaPending = true;
+  otaInProgress = false;
+
+  markRpcResult("updateFirmware", "queued");
+
+  String response = "{\"success\":true,\"message\":\"OTA queued\",\"targetVersion\":\"";
+  response += jsonEscape(otaTargetVersion.c_str());
+  response += "\"}";
+  sendRpcResponse(requestId, response);
+
+  sendTelemetryNow("ota-queued");
+#else
+  markRpcResult("updateFirmware", "ota-disabled");
+  sendRpcResponse(requestId, "{\"success\":false,\"message\":\"OTA disabled in config\"}");
+#endif
+}
+
 
 void handleRpcRequest(const String &requestId, const String &method, const String &paramsRaw) {
   Serial.print("[RPC] Method=");
@@ -1969,7 +2104,7 @@ void handleRpcRequest(const String &requestId, const String &method, const Strin
   } else if (method == "setTelemetryInterval") {
     handleRpcSetTelemetryInterval(requestId, paramsRaw);
   } else if (method == "updateFirmware") {
-    handleRpcUpdateFirmware(requestId);
+    handleRpcUpdateFirmware(requestId, paramsRaw);
   } else {
     markRpcResult(method.c_str(), "unknown-method");
 
@@ -2030,6 +2165,122 @@ void updateScheduledRestartNonBlocking() {
     delay(50);
     ESP.restart();
   }
+}
+
+bool performOtaUpdate(const String &firmwareUrl) {
+#if OTA_ENABLED
+  if (WiFi.status() != WL_CONNECTED) {
+    setOtaError("wifi-not-connected");
+    return false;
+  }
+
+  otaStatus = "downloading";
+  otaInProgress = true;
+  otaPending = false;
+  otaLastError = "";
+
+  Serial.println("[OTA] Starting firmware update...");
+  Serial.print("[OTA] URL: ");
+  Serial.println(firmwareUrl);
+
+  sendTelemetryNow("ota-start");
+
+  WiFiClientSecure secureClient;
+#if OTA_ALLOW_INSECURE_TLS
+  // MVP mode: khong verify certificate de tranh loi chain/cert tren ESP32.
+  // Ban san xuat nen dung certificate pinning/CA root.
+  secureClient.setInsecure();
+#endif
+
+  HTTPClient http;
+  http.setTimeout(OTA_HTTP_TIMEOUT_MS);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  if (!http.begin(secureClient, firmwareUrl)) {
+    setOtaError("http-begin-failed");
+    return false;
+  }
+
+  int httpCode = http.GET();
+
+  if (httpCode != HTTP_CODE_OK) {
+    String err = "http-code-";
+    err += String(httpCode);
+    http.end();
+    setOtaError(err);
+    return false;
+  }
+
+  int contentLength = http.getSize();
+
+  Serial.print("[OTA] Content-Length: ");
+  Serial.println(contentLength);
+
+  if (!Update.begin(contentLength > 0 ? contentLength : UPDATE_SIZE_UNKNOWN)) {
+    String err = "update-begin-failed:";
+    err += Update.errorString();
+    http.end();
+    setOtaError(err);
+    return false;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  size_t written = Update.writeStream(*stream);
+
+  Serial.print("[OTA] Written bytes: ");
+  Serial.println(written);
+
+  if (contentLength > 0 && written != (size_t)contentLength) {
+    String err = "size-mismatch:";
+    err += String(written);
+    err += "/";
+    err += String(contentLength);
+    Update.abort();
+    http.end();
+    setOtaError(err);
+    return false;
+  }
+
+  if (!Update.end(true)) {
+    String err = "update-end-failed:";
+    err += Update.errorString();
+    http.end();
+    setOtaError(err);
+    return false;
+  }
+
+  if (!Update.isFinished()) {
+    http.end();
+    setOtaError("update-not-finished");
+    return false;
+  }
+
+  http.end();
+
+  otaStatus = "success";
+  otaInProgress = false;
+  otaPending = false;
+  otaLastError = "";
+
+  markRpcResult("updateFirmware", "success");
+
+  Serial.println("[OTA] Update success. Restarting...");
+  sendTelemetryNow("ota-success");
+
+  delay(OTA_RESTART_DELAY_MS);
+  ESP.restart();
+
+  return true;
+#else
+  setOtaError("ota-disabled");
+  return false;
+#endif
+}
+
+void updateOtaNonBlocking() {
+  if (!otaPending || otaInProgress) return;
+
+  performOtaUpdate(otaPendingUrl);
 }
 
 
@@ -2125,7 +2376,7 @@ void setup() {
   Serial.println("====================================");
   Serial.print("HP12 ");
   Serial.print(FIRMWARE_VERSION);
-  Serial.println(" RPC CONTROL BRIDGE started.");
+  Serial.println(" OTA UPDATE BRIDGE started.");
   Serial.print("DHT PIN: GPIO");
   Serial.println(DHT_PIN);
   Serial.print("LIGHT AO PIN: GPIO");
@@ -2155,6 +2406,7 @@ void loop() {
   updateEnvironmentLedAndBuzzerNonBlocking();
   updateBlueLedNonBlocking();
   updateCloudNonBlocking();
+  updateOtaNonBlocking();
   updateScheduledRestartNonBlocking();
 
   // Khong delay dai.

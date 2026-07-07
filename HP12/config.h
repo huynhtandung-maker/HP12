@@ -23,7 +23,7 @@
 
 #define DEVICE_NAME        "HP12"
 #define DEVICE_MODEL       "ESP32_HP12"
-#define FIRMWARE_VERSION   "v1.7.1"
+#define FIRMWARE_VERSION   "v1.8.0"
 
 // =========================
 // PIN CONFIG
@@ -219,3 +219,18 @@
 #define FOCUS_SCORE_MAX              100.0
 #define FOCUS_SCORE_WARN             70.0
 #define FOCUS_SCORE_DANGER           45.0
+
+
+// =========================
+// OTA UPDATE CONFIG
+// =========================
+//
+// OTA qua RPC updateFirmware.
+// v1.8.0 yeu cau firmware URL la HTTPS co the tai truc tiep tu ESP32.
+// Neu dung GitHub Release asset, repo/asset phai truy cap duoc cong khai
+// hoac phai co co che proxy/token an toan rieng.
+#define OTA_ENABLED                   1
+#define OTA_ALLOW_INSECURE_TLS        1
+#define OTA_HTTP_TIMEOUT_MS           20000UL
+#define OTA_RESTART_DELAY_MS          1200UL
+#define OTA_REQUIRE_HTTPS             1
