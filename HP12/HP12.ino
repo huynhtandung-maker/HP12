@@ -3,6 +3,9 @@
 #include "secrets.h"
 
 #include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
 #include <PubSubClient.h>
 #include <esp_system.h>
 #include <HTTPClient.h>
@@ -14,9 +17,9 @@
 #include <Adafruit_SSD1306.h>
 
 // ============================================================================
-// HP12 v1.8.0
-// Clean UI + line gauge + advice button.
-// This code is intentionally verbose and commented for future maintenance.
+// HP12 v1.12.3 - DeepWork Tropical + WiFi State Machine Fix
+// Dong bo voi config.h DeepWork Tropical.
+// Muc tieu: giu nguyen logic HP12, sua xung dot WiFi STA/AP khi mang moi, va toi uu LED/coi theo khi hau Viet Nam.
 // ============================================================================
 
 // =========================
@@ -119,6 +122,15 @@
 #endif
 
 
+#ifndef OTA_OLED_SUCCESS_HOLD_MS
+#define OTA_OLED_SUCCESS_HOLD_MS 2500UL
+#endif
+
+#ifndef OTA_OLED_ERROR_HOLD_MS
+#define OTA_OLED_ERROR_HOLD_MS 2500UL
+#endif
+
+
 #ifndef OLED_SAFE_X
 #define OLED_SAFE_X 0
 #endif
@@ -139,6 +151,125 @@
 #define OLED_GAUGE_W 112
 #endif
 
+
+#ifndef WIFI_SETUP_PORTAL_ENABLED
+#define WIFI_SETUP_PORTAL_ENABLED 1
+#endif
+
+#ifndef WIFI_CONNECT_TIMEOUT_MS
+#define WIFI_CONNECT_TIMEOUT_MS 35000UL
+#endif
+
+#ifndef WIFI_SETUP_AP_SSID
+#define WIFI_SETUP_AP_SSID "HP12-SETUP"
+#endif
+
+#ifndef WIFI_SETUP_AP_PASSWORD
+#define WIFI_SETUP_AP_PASSWORD ""
+#endif
+
+#ifndef WIFI_SETUP_RESTART_MS
+#define WIFI_SETUP_RESTART_MS 2500UL
+#endif
+
+#ifndef WIFI_SETUP_TRIGGER_HOLD_MS
+#define WIFI_SETUP_TRIGGER_HOLD_MS 5500UL
+#endif
+
+#ifndef WIFI_SETUP_DNS_PORT
+#define WIFI_SETUP_DNS_PORT 53
+#endif
+
+#ifndef WIFI_SETUP_PREF_NAMESPACE
+#define WIFI_SETUP_PREF_NAMESPACE "hp12wifi"
+#endif
+
+// =========================
+// DEEPWORK TROPICAL FALLBACKS
+// =========================
+// Cac macro nay chi co tac dung khi config.h chua khai bao.
+// Neu ban dung config.h v1.12.1 DeepWork Tropical thi cac gia tri trong config.h duoc uu tien.
+
+#ifndef BUZZER_WARN_ENABLED
+#define BUZZER_WARN_ENABLED 0
+#endif
+#ifndef BUZZER_WARN_PERIOD_MS
+#define BUZZER_WARN_PERIOD_MS 60000UL
+#endif
+#ifndef BUZZER_WARN_ON_MS
+#define BUZZER_WARN_ON_MS 35UL
+#endif
+#ifndef BUZZER_NORMAL_PERIOD_MS
+#define BUZZER_NORMAL_PERIOD_MS 22000UL
+#endif
+#ifndef BUZZER_NORMAL_ON_MS
+#define BUZZER_NORMAL_ON_MS 55UL
+#endif
+#ifndef BUZZER_NORMAL_GAP_MS
+#define BUZZER_NORMAL_GAP_MS 130UL
+#endif
+#ifndef BUZZER_NORMAL_COUNT
+#define BUZZER_NORMAL_COUNT 2
+#endif
+#ifndef BUZZER_STRONG_PERIOD_MS
+#define BUZZER_STRONG_PERIOD_MS 8000UL
+#endif
+#ifndef BUZZER_STRONG_ON_MS
+#define BUZZER_STRONG_ON_MS 75UL
+#endif
+#ifndef BUZZER_STRONG_GAP_MS
+#define BUZZER_STRONG_GAP_MS 110UL
+#endif
+#ifndef BUZZER_STRONG_COUNT
+#define BUZZER_STRONG_COUNT 3
+#endif
+
+#ifndef HEAT_INDEX_MED_CAUTION_C
+#define HEAT_INDEX_MED_CAUTION_C 32.0
+#endif
+#ifndef HEAT_INDEX_MED_DANGER_C
+#define HEAT_INDEX_MED_DANGER_C 39.0
+#endif
+#ifndef HEAT_INDEX_MED_EXTREME_C
+#define HEAT_INDEX_MED_EXTREME_C 51.0
+#endif
+
+#ifndef FOCUS_SCORE_WARN
+#define FOCUS_SCORE_WARN 65.0
+#endif
+#ifndef FOCUS_SCORE_DANGER
+#define FOCUS_SCORE_DANGER 35.0
+#endif
+
+// =========================
+// WIFI STABILITY FALLBACKS
+// =========================
+// Muc tieu: mang cu thi tu nho; mang moi/khong thay SSID thi mo HP12-SETUP ro rang.
+#ifndef WIFI_CONNECT_FAIL_LIMIT
+#define WIFI_CONNECT_FAIL_LIMIT 2
+#endif
+#ifndef WIFI_SCAN_BEFORE_PORTAL
+#define WIFI_SCAN_BEFORE_PORTAL 1
+#endif
+#ifndef WIFI_ALLOW_HIDDEN_SSID
+#define WIFI_ALLOW_HIDDEN_SSID 0
+#endif
+#ifndef WIFI_STABLE_AFTER_CONNECT_MS
+#define WIFI_STABLE_AFTER_CONNECT_MS 2500UL
+#endif
+#ifndef WIFI_PORTAL_ON_SSID_NOT_FOUND
+#define WIFI_PORTAL_ON_SSID_NOT_FOUND 1
+#endif
+#ifndef WIFI_RADIO_SETTLE_MS
+#define WIFI_RADIO_SETTLE_MS 180UL
+#endif
+#ifndef WIFI_PORTAL_RADIO_RESET_MS
+#define WIFI_PORTAL_RADIO_RESET_MS 260UL
+#endif
+#ifndef WIFI_BEGIN_REISSUE_GUARD_MS
+#define WIFI_BEGIN_REISSUE_GUARD_MS 1000UL
+#endif
+
 // =========================
 // OBJECTS
 // =========================
@@ -148,6 +279,10 @@ Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
+
+Preferences wifiPrefs;
+WebServer wifiSetupServer(80);
+DNSServer wifiSetupDns;
 
 // =========================
 // STATE TYPES
@@ -184,6 +319,7 @@ enum DisplayPage {
   PAGE_TEMP,
   PAGE_HUM,
   PAGE_LIGHT,
+  PAGE_WIFI_SETUP,
   PAGE_BASIS,
   PAGE_ADVICE,
   PAGE_HELP
@@ -292,6 +428,40 @@ String lastRpcResult = "none";
 unsigned long lastRpcAtMs = 0;
 
 bool rpcSubscribed = false;
+
+
+// =========================
+// WIFI PROVISIONING STATE
+// =========================
+// v1.9.0:
+// - WiFi moi: mo portal HP12-SETUP de nguoi dung nhap WiFi bang dien thoai.
+// - WiFi cu: luu trong Preferences/NVS, mat dien van nho.
+// - Khi khong ket noi duoc WiFi sau timeout, tu mo portal va OLED huong dan.
+bool wifiCredentialsLoaded = false;
+bool wifiUsingStoredCredentials = false;
+bool wifiPortalActive = false;
+bool wifiPortalSaveOk = false;
+bool wifiEverConnectedThisBoot = false;
+
+String activeWifiSsid = "";
+String activeWifiPassword = "";
+String wifiPortalReason = "idle";
+String wifiPortalMessage = "";
+String wifiLastFailure = "none";
+
+unsigned long wifiConnectStartedMs = 0;
+unsigned long wifiPortalStartedMs = 0;
+unsigned long wifiPortalSavedAtMs = 0;
+unsigned long wifiBothButtonHoldStartMs = 0;
+bool wifiBothButtonHandled = false;
+
+// Bo dem on dinh WiFi. Chi dung khi WiFi cu khong ket noi duoc.
+// Khong can thiep vao MQTT/ThingsBoard, chi quyet dinh luc nao mo HP12-SETUP.
+uint8_t wifiConnectFailCount = 0;
+int wifiLastScanCount = -1;
+int wifiLastRssi = -999;
+String wifiLastScanSummary = "not-scanned";
+unsigned long wifiConnectedAtMs = 0;
 
 
 // =========================
@@ -518,6 +688,10 @@ const char* getAdviceMessage() {
 }
 
 const char* getScrollingMessage() {
+  if (wifiPortalActive || currentPage == PAGE_WIFI_SETUP) {
+    return "CAI WIFI: Ket noi vao WiFi HP12-SETUP, mo trinh duyet 192.168.4.1, nhap WiFi moi va luu. Sau khi luu HP12 se tu restart va tu nho mang nay.";
+  }
+
   if (currentPage == PAGE_ADVICE) {
     return getAdviceMessage();
   }
@@ -628,29 +802,43 @@ LightState classifyLight(float pct) {
 float calculateFocusScore() {
   if (!sensorHasValidData) return 0.0;
 
+  // FocusScore = diem UX noi bo cho "deep work", khong phai chan doan y te.
+  // Ban tropical khong phat do qua som vi Viet Nam nong am hon chau Au.
+  // Diem bi tru theo tung lop: cam nhan nhiet, do am, nhiet phong, anh sang.
   float score = 100.0;
 
-  if (thermalState == THERMAL_DANGER) score -= 55.0;
-  else if (thermalState == THERMAL_WARN) score -= 25.0;
+  if (thermalState == THERMAL_DANGER) {
+    score -= 45.0;
+  } else if (thermalState == THERMAL_WARN) {
+    score -= 22.0;
+  }
 
   if (!isnan(heatIndexC)) {
-    if (heatIndexC >= HEAT_INDEX_MED_DANGER_C) score -= 15.0;
-    if (heatIndexC >= HEAT_INDEX_MED_EXTREME_C) score -= 20.0;
+    if (heatIndexC >= HEAT_INDEX_MED_EXTREME_C) score -= 35.0;
+    else if (heatIndexC >= HEAT_INDEX_MED_DANGER_C) score -= 22.0;
+    else if (heatIndexC >= HEAT_INDEX_MED_CAUTION_C) score -= 10.0;
+  }
+
+  if (!isnan(humidity)) {
+    if (humidity >= HUM_DANGER) score -= 18.0;
+    else if (humidity >= HUM_WARN) score -= 10.0;
+    else if (humidity > HUM_GOOD_MAX) score -= 5.0;
+  }
+
+  if (!isnan(tempC)) {
+    if (tempC >= TEMP_DANGER) score -= 18.0;
+    else if (tempC >= TEMP_WARN) score -= 8.0;
+    else if (tempC < TEMP_GOOD_MIN) score -= 4.0;
   }
 
 #if LIGHT_SENSOR_ENABLED
-  if (lightState == LIGHT_DARK) score -= 22.0;
-  if (lightState == LIGHT_GLARE) score -= 22.0;
-  if (lightState == LIGHT_BRIGHT) score -= 10.0;
+  if (lightState == LIGHT_DARK) score -= 18.0;
+  if (lightState == LIGHT_GLARE) score -= 18.0;
+  if (lightState == LIGHT_BRIGHT) score -= 8.0;
 #endif
-
-  if (!isnan(humidity) && humidity > HUM_GOOD_MAX && humidity < HUM_WARN) {
-    score -= 8.0;
-  }
 
   return clampFloat(score, 0.0, 100.0);
 }
-
 void updateComfortState() {
   if (comfortState == STATE_SENSOR_ERROR || comfortState == STATE_SENSOR_SUSPECT) {
     focusScore = 0.0;
@@ -665,7 +853,9 @@ void updateComfortState() {
 
   focusScore = calculateFocusScore();
 
-  if (thermalState == THERMAL_DANGER) {
+  // RED: chi khi stress nhiet ro hoac FocusScore qua thap.
+  // Dieu nay giup LED xanh/vang/do huu dung hon trong khi hau nong am Viet Nam.
+  if (thermalState == THERMAL_DANGER || focusScore <= FOCUS_SCORE_DANGER) {
     comfortState = STATE_DANGER;
     return;
   }
@@ -677,7 +867,7 @@ void updateComfortState() {
   }
 #endif
 
-  if (thermalState == THERMAL_WARN) {
+  if (thermalState == THERMAL_WARN || focusScore < FOCUS_SCORE_WARN) {
     comfortState = STATE_WARN;
     return;
   }
@@ -689,7 +879,6 @@ void updateComfortState() {
 
   comfortState = STATE_WARN;
 }
-
 // =========================
 // SENSOR READ
 // =========================
@@ -1030,37 +1219,23 @@ void printClippedText(const char* text, int x, int y, int maxPx) {
 void drawHeader(const char* title) {
   display.setTextSize(1);
 
-  // Safe viewport: khong ve sat bien phai vat ly.
   const int leftX = OLED_SAFE_X;
   const int rightX = OLED_SAFE_RIGHT;
 
-  // Title chi chiem vung trai, tranh tran sang trang thai.
-  printClippedText(title, leftX, 0, 68);
+  // Header gon cua v1.9.0:
+  // - Trai: ten tab ngan.
+  // - Giua/phai: firmware hien hanh.
+  // - Cuoi phai: tinh trang cloud 1 ky tu.
+  // Khong chen trang thai NONG/CANH vao header nua de tranh de chu.
+  printClippedText(title, leftX, 0, 50);
 
-  // Cloud indicator: C = ThingsBoard connected, W = WiFi only, L = local/offline.
-  display.setCursor(leftX + 66, 0);
+  display.setCursor(58, 0);
+  display.print(FIRMWARE_VERSION);
+
+  display.setCursor(rightX - 5, 0);
   if (mqttClient.connected()) display.print("C");
   else if (WiFi.status() == WL_CONNECTED) display.print("W");
   else display.print("L");
-
-  // Alarm indicator rat ngan.
-  display.setCursor(leftX + 76, 0);
-  if (alarmIsMuted()) display.print("M");
-  else {
-    switch (alarmProfile) {
-      case ALARM_QUIET:  display.print("I"); break;
-      case ALARM_STRONG: display.print("M"); break;
-      default:           display.print("V"); break;
-    }
-  }
-
-  // State canh phai trong safe viewport.
-  const char* state = getStateCode();
-  int stateX = rightX - textWidth6(state) + 1;
-  if (stateX < leftX + 88) stateX = leftX + 88;
-
-  display.setCursor(stateX, 0);
-  display.print(state);
 
   display.drawLine(leftX, 11, rightX, 11, SSD1306_WHITE);
 }
@@ -1122,63 +1297,109 @@ void drawFooterScroll() {
 
 void drawSensorIssuePage() {
   if (comfortState == STATE_SENSOR_ERROR) {
-    display.setCursor(0, 18);
+    display.setCursor(OLED_SAFE_X, 18);
     display.print("DHT22 KHONG DOC");
 
-    display.setCursor(0, 32);
+    display.setCursor(OLED_SAFE_X, 32);
     display.print("Kiem tra 3V3 GND");
 
-    display.setCursor(0, 44);
+    display.setCursor(OLED_SAFE_X, 44);
     display.print("DATA GPIO");
     display.print(DHT_PIN);
     return;
   }
 
   if (comfortState == STATE_SENSOR_SUSPECT) {
-    display.setCursor(0, 18);
+    display.setCursor(OLED_SAFE_X, 18);
     display.print("DU LIEU DHT NGHI NGO");
 
-    display.setCursor(0, 32);
+    display.setCursor(OLED_SAFE_X, 32);
     display.print("T:");
     display.print(rawTempC, 1);
     display.print(" H:");
     display.print(rawHumidity, 1);
 
-    display.setCursor(0, 44);
+    display.setCursor(OLED_SAFE_X, 44);
     display.print("Kiem tra sensor");
   }
 }
 
+
+void drawMiniMetric(int x, int y, const char* label, float value, const char* unit, int decimals) {
+  display.setTextSize(1);
+  display.setCursor(x, y);
+  display.print(label);
+  display.print(":");
+  if (isnan(value)) {
+    display.print("--");
+  } else {
+    display.print(value, decimals);
+  }
+  display.print(unit);
+}
+
+void drawStatusPill(int x, int y, const char* text) {
+  int w = textWidth6(text) + 6;
+  if (w > 56) w = 56;
+  display.drawRoundRect(x, y, w, 12, 3, SSD1306_WHITE);
+  display.setCursor(x + 3, y + 2);
+  printClippedText(text, x + 3, y + 2, w - 6);
+}
+
+void drawCompactLineGauge(int x, int y, int w, float value, float minV, float maxV, float goodMin, float goodMax) {
+  // Gauge cuc gon cho trang tong quan:
+  // 1 line ngang, 1 doan vung tot, 1 vach gia tri hien tai.
+  display.drawFastHLine(x, y, w, SSD1306_WHITE);
+
+  int goodX1 = valueToX(x, w, goodMin, minV, maxV);
+  int goodX2 = valueToX(x, w, goodMax, minV, maxV);
+  if (goodX2 > goodX1) {
+    display.drawFastHLine(goodX1, y + 2, goodX2 - goodX1, SSD1306_WHITE);
+  }
+
+  int curX = valueToX(x, w, value, minV, maxV);
+  display.drawFastVLine(curX, y - 4, 9, SSD1306_WHITE);
+}
+
 void drawHomePage() {
-  drawHeader("TONG QUAN");
+  drawHeader("HOME");
 
   if (!sensorHasValidData) {
     drawSensorIssuePage();
     return;
   }
 
-  display.setTextSize(1);
-  display.setCursor(0, 15);
-  display.print("FOCUS");
+  // v1.9.0 tong quan: khong con nhon nhet.
+  // Hang 1: trang thai cam nhan + hanh dong chinh.
+  drawStatusPill(OLED_SAFE_X, 14, getStateText());
+  display.setCursor(64, 16);
+  printClippedText(getShortActionText(), 64, 16, 54);
 
+  // Hang 2: chi so cam nhan nhiet la nhan vat chinh.
   display.setTextSize(2);
-  display.setCursor(0, 27);
+  display.setCursor(OLED_SAFE_X, 28);
+  display.print(heatIndexC, 0);
+  display.setTextSize(1);
+  display.setCursor(31, 33);
+  display.print("C HI");
+
+  // Ben phai: focus score lon vua du.
+  display.setCursor(66, 29);
+  display.print("Focus ");
   display.print((int)focusScore);
 
-  display.setTextSize(1);
-  display.setCursor(47, 31);
-  display.print("/100");
+  // Hang 3: 3 thong so nen, moi thong so 1 cum ngan.
+  drawMiniMetric(OLED_SAFE_X, 44, "T", tempC, "C", 1);
+  drawMiniMetric(42, 44, "H", humidity, "%", 0);
+#if LIGHT_SENSOR_ENABLED
+  drawMiniMetric(82, 44, "L", lightPercent, "%", 0);
+#else
+  display.setCursor(82, 44);
+  display.print("L:OFF");
+#endif
 
-  display.setCursor(66, 18);
-  printClippedText(getFocusText(), 66, 18, 54);
-
-  display.setCursor(66, 32);
-  display.print("HI ");
-  display.print(heatIndexC, 0);
-  display.print("C");
-
-  display.setCursor(66, 44);
-  printClippedText(getShortActionText(), 66, 44, 54);
+  // Bottom: gauge ngan cho heat index, khong de so len than chart.
+  drawCompactLineGauge(6, 57, 108, heatIndexC, HEAT_BAR_MIN_C, HEAT_BAR_MAX_C, HEAT_BAR_MIN_C, HEAT_INDEX_WARN);
 }
 
 void drawFocusPage() {
@@ -1355,6 +1576,128 @@ void drawHelpPage() {
   display.print("ADV: loi khuyen");
 }
 
+
+
+void drawWifiSetupPage() {
+  drawHeader("CAI WIFI");
+
+  display.setTextSize(1);
+
+  if (wifiPortalSaveOk) {
+    display.setCursor(OLED_SAFE_X, 15);
+    display.print("DA LUU WIFI");
+
+    display.setCursor(OLED_SAFE_X, 28);
+    printClippedText(activeWifiSsid.c_str(), OLED_SAFE_X, 28, OLED_SAFE_W);
+
+    display.setCursor(OLED_SAFE_X, 41);
+    display.print("HP12 dang reset...");
+
+    display.drawLine(OLED_SAFE_X, 54, OLED_SAFE_RIGHT, 54, SSD1306_WHITE);
+    display.setCursor(OLED_SAFE_X, 56);
+    display.print("Lan sau tu ket noi");
+    return;
+  }
+
+  display.setCursor(OLED_SAFE_X, 14);
+  display.print("1 Ket noi dien thoai");
+
+  display.setCursor(OLED_SAFE_X, 25);
+  display.print("WiFi: ");
+  display.print(WIFI_SETUP_AP_SSID);
+
+  display.setCursor(OLED_SAFE_X, 37);
+  display.print("2 Mo: 192.168.4.1");
+
+  display.setCursor(OLED_SAFE_X, 49);
+  display.print("Nhap WiFi moi");
+
+  // Portal heartbeat ben phai: cham nhay = AP/DNS/WebServer dang song.
+  if (((millis() / 500) % 2) == 0) {
+    display.fillCircle(OLED_SAFE_RIGHT - 3, 58, 2, SSD1306_WHITE);
+  }
+}
+
+bool otaVisualActive() {
+  if (otaPending || otaInProgress) return true;
+  if (otaStatus == "queued") return true;
+  if (otaStatus == "downloading") return true;
+  if (otaStatus == "writing") return true;
+  if (otaStatus == "success") return true;
+  if (otaStatus == "error") return true;
+  return false;
+}
+
+void drawOtaScreenNow(const char* line1, const char* line2, const char* line3) {
+  if (!oledReady) return;
+
+  display.clearDisplay();
+  display.setTextWrap(false);
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(OLED_SAFE_X, 0);
+  display.print("OTA");
+  display.setCursor(34, 0);
+  display.print("Now ");
+  display.print(FIRMWARE_VERSION);
+  display.drawLine(OLED_SAFE_X, 11, OLED_SAFE_RIGHT, 11, SSD1306_WHITE);
+
+  display.setCursor(OLED_SAFE_X, 16);
+  printClippedText(line1, OLED_SAFE_X, 16, OLED_SAFE_W);
+
+  display.setCursor(OLED_SAFE_X, 29);
+  printClippedText(line2, OLED_SAFE_X, 29, OLED_SAFE_W);
+
+  display.setCursor(OLED_SAFE_X, 42);
+  printClippedText(line3, OLED_SAFE_X, 42, OLED_SAFE_W);
+
+  display.drawLine(OLED_SAFE_X, 53, OLED_SAFE_RIGHT, 53, SSD1306_WHITE);
+  display.setCursor(OLED_SAFE_X, 56);
+  display.print("KHONG RUT NGUON");
+  display.display();
+}
+
+void drawOtaPage() {
+  // Trang OTA la che do dac biet, khong dung footer scrolling.
+  drawHeader("OTA");
+
+  display.setTextSize(1);
+
+  display.setCursor(OLED_SAFE_X, 15);
+  display.print("Now : ");
+  display.print(FIRMWARE_VERSION);
+
+  display.setCursor(OLED_SAFE_X, 27);
+  display.print("Next: ");
+  if (otaTargetVersion.length() && otaTargetVersion != "unknown") {
+    printClippedText(otaTargetVersion.c_str(), 38, 27, 80);
+  } else {
+    display.print("latest");
+  }
+
+  display.setCursor(OLED_SAFE_X, 39);
+  display.print("Run : ");
+  if (otaStatus == "queued") display.print("cho lenh");
+  else if (otaStatus == "downloading") display.print("dang tai");
+  else if (otaStatus == "writing") display.print("dang ghi");
+  else if (otaStatus == "success") display.print("sap reset");
+  else if (otaStatus == "error") display.print("bi loi");
+  else display.print(otaStatus);
+
+  display.drawLine(OLED_SAFE_X, 52, OLED_SAFE_RIGHT, 52, SSD1306_WHITE);
+  display.setCursor(OLED_SAFE_X, 55);
+
+  if (otaStatus == "error") {
+    printClippedText(otaLastError.c_str(), OLED_SAFE_X, 55, OLED_SAFE_W);
+  } else if (otaStatus == "success") {
+    display.print("Restart de ap dung");
+  } else {
+    display.print("Dung tat nguon HP12");
+  }
+}
+
+
 void updateOledNonBlocking() {
   if (!oledReady) return;
 
@@ -1368,6 +1711,21 @@ void updateOledNonBlocking() {
   display.clearDisplay();
   display.setTextWrap(false);
   display.setTextColor(SSD1306_WHITE);
+
+  // Khi WiFi setup portal dang mo, uu tien huong dan nguoi dung cai mang moi.
+  if (wifiPortalActive) {
+    drawWifiSetupPage();
+    display.display();
+    return;
+  }
+
+  // Khi OTA dang dien ra, uu tien man hinh OTA thay vi cac tab thong thuong.
+  // Nguoi dung can thay ro: dang update, target version, va se restart.
+  if (otaVisualActive()) {
+    drawOtaPage();
+    display.display();
+    return;
+  }
 
   switch (currentPage) {
     case PAGE_FOCUS:
@@ -1394,6 +1752,10 @@ void updateOledNonBlocking() {
       drawBasisPage();
       break;
 
+    case PAGE_WIFI_SETUP:
+      drawWifiSetupPage();
+      break;
+
     case PAGE_ADVICE:
       drawAdvicePage();
       break;
@@ -1408,7 +1770,12 @@ void updateOledNonBlocking() {
       break;
   }
 
-  drawFooterScroll();
+  // Footer cuon chi dung cho trang co thong diep dai.
+  // Cac trang gauge/tong quan khong ve footer de tranh de chu/chart.
+  if (currentPage == PAGE_ADVICE || currentPage == PAGE_HELP || currentPage == PAGE_BASIS || currentPage == PAGE_WIFI_SETUP) {
+    drawFooterScroll();
+  }
+
   display.display();
 }
 
@@ -1603,6 +1970,362 @@ void jsonAddFloat(String &payload, bool &first, const char* key, float value, in
   payload += String(value, decimals);
 }
 
+
+// =========================
+// WIFI SETUP PORTAL
+// =========================
+
+String htmlEscape(String s) {
+  s.replace("&", "&amp;");
+  s.replace("<", "&lt;");
+  s.replace(">", "&gt;");
+  s.replace("\"", "&quot;");
+  return s;
+}
+
+
+bool isPlaceholderWifiName(const String &ssid) {
+  String s = ssid;
+  s.trim();
+  s.toUpperCase();
+  if (s.length() == 0) return true;
+  if (s == "YOUR_FALLBACK_WIFI_NAME") return true;
+  if (s == "YOUR_WIFI_SSID") return true;
+  if (s == "WIFI_SSID") return true;
+  if (s.indexOf("FALLBACK") >= 0) return true;
+  if (s.indexOf("PLACEHOLDER") >= 0) return true;
+  if (s.indexOf("CHANGE_ME") >= 0) return true;
+  return false;
+}
+
+bool hasActiveWifiCredentials() {
+  return activeWifiSsid.length() > 0 && !isPlaceholderWifiName(activeWifiSsid);
+}
+
+void stopStaConnectCleanly(const char *reason) {
+  Serial.print("[WiFi] Stop STA cleanly: ");
+  Serial.println(reason);
+  WiFi.disconnect(false, false);
+  delay(WIFI_RADIO_SETTLE_MS);
+}
+
+void prepareWifiRadioForSta() {
+  // Chỉ dùng trước khi gọi WiFi.begin().
+  // Tránh lỗi ESP-IDF: "sta is connecting, cannot set config" khi begin bị gọi chồng.
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  delay(WIFI_RADIO_SETTLE_MS);
+}
+
+void prepareWifiRadioForPortalAp() {
+  // Khi mở captive portal, phải dừng hẳn STA đang handshake/DHCP.
+  // Nếu vẫn để WIFI_AP_STA trong lúc STA đang connecting, ESP32 có thể báo:
+  // E wifi:sta is connecting, cannot set config.
+  WiFi.disconnect(true, false);
+  delay(WIFI_PORTAL_RADIO_RESET_MS);
+  WiFi.mode(WIFI_OFF);
+  delay(WIFI_PORTAL_RADIO_RESET_MS);
+  WiFi.mode(WIFI_AP);
+  delay(WIFI_RADIO_SETTLE_MS);
+}
+
+bool isSavedSsidVisible(const String &ssid) {
+#if WIFI_SCAN_BEFORE_PORTAL
+  if (isPlaceholderWifiName(ssid)) return false;
+
+  stopStaConnectCleanly("scan-before-portal");
+  prepareWifiRadioForSta();
+
+  Serial.print("[WiFi] Scanning before portal. Target SSID=");
+  Serial.println(ssid);
+
+  int n = WiFi.scanNetworks(false, true);
+  wifiLastScanCount = n;
+  bool found = false;
+  int bestRssi = -999;
+
+  if (n > 0) {
+    for (int i = 0; i < n; i++) {
+      if (WiFi.SSID(i) == ssid) {
+        found = true;
+        if (WiFi.RSSI(i) > bestRssi) bestRssi = WiFi.RSSI(i);
+      }
+    }
+  }
+
+  WiFi.scanDelete();
+  wifiLastRssi = bestRssi;
+  wifiLastScanSummary = found ? "ssid-visible" : "ssid-not-found";
+
+  Serial.print("[WiFi] Scan result: ");
+  Serial.print(wifiLastScanSummary);
+  Serial.print(" | networks=");
+  Serial.print(n);
+  Serial.print(" | best RSSI=");
+  Serial.println(bestRssi);
+
+  return found;
+#else
+  (void)ssid;
+  wifiLastScanSummary = "scan-disabled";
+  return true;
+#endif
+}
+
+void loadWifiCredentials() {
+#if WIFI_SETUP_PORTAL_ENABLED
+  wifiPrefs.begin(WIFI_SETUP_PREF_NAMESPACE, true);
+  String savedSsid = wifiPrefs.getString("ssid", "");
+  String savedPass = wifiPrefs.getString("pass", "");
+  wifiPrefs.end();
+
+  if (savedSsid.length() > 0 && !isPlaceholderWifiName(savedSsid)) {
+    activeWifiSsid = savedSsid;
+    activeWifiPassword = savedPass;
+    wifiUsingStoredCredentials = true;
+    wifiCredentialsLoaded = true;
+    Serial.print("[WiFi] Loaded saved WiFi: ");
+    Serial.println(activeWifiSsid);
+    return;
+  }
+
+  if (savedSsid.length() > 0 && isPlaceholderWifiName(savedSsid)) {
+    Serial.println("[WiFi] Ignored placeholder saved SSID. Portal will be used.");
+  }
+#endif
+
+  // Fallback cho nguoi phat trien: neu chua co WiFi trong Preferences,
+  // dung secrets.h de thiet bi khong bi mat ket noi ngay sau khi OTA len v1.9.0.
+  // Sau khi ket noi thanh cong, firmware se tu luu vao Preferences.
+  if (strlen(WIFI_SSID) > 0 && !isPlaceholderWifiName(String(WIFI_SSID))) {
+    activeWifiSsid = WIFI_SSID;
+    activeWifiPassword = WIFI_PASSWORD;
+    wifiUsingStoredCredentials = false;
+    wifiCredentialsLoaded = true;
+    Serial.print("[WiFi] Using fallback WiFi from secrets.h: ");
+    Serial.println(activeWifiSsid);
+    return;
+  }
+
+  if (strlen(WIFI_SSID) > 0 && isPlaceholderWifiName(String(WIFI_SSID))) {
+    Serial.println("[WiFi] Ignored placeholder fallback WiFi in secrets.h.");
+  }
+
+  activeWifiSsid = "";
+  activeWifiPassword = "";
+  wifiUsingStoredCredentials = false;
+  wifiCredentialsLoaded = true;
+  Serial.println("[WiFi] No WiFi credentials found.");
+}
+
+bool saveWifiCredentials(const String &ssid, const String &pass) {
+#if WIFI_SETUP_PORTAL_ENABLED
+  if (ssid.length() == 0) return false;
+  if (isPlaceholderWifiName(ssid)) return false;
+
+  wifiPrefs.begin(WIFI_SETUP_PREF_NAMESPACE, false);
+  bool ok1 = wifiPrefs.putString("ssid", ssid) > 0;
+  bool ok2 = wifiPrefs.putString("pass", pass) >= 0;
+  wifiPrefs.end();
+
+  activeWifiSsid = ssid;
+  activeWifiPassword = pass;
+  wifiUsingStoredCredentials = true;
+  wifiCredentialsLoaded = true;
+
+  Serial.print("[WiFi] Saved WiFi to Preferences: ");
+  Serial.println(ssid);
+  return ok1 && ok2;
+#else
+  return false;
+#endif
+}
+
+void clearWifiCredentials() {
+#if WIFI_SETUP_PORTAL_ENABLED
+  wifiPrefs.begin(WIFI_SETUP_PREF_NAMESPACE, false);
+  wifiPrefs.clear();
+  wifiPrefs.end();
+#endif
+
+  activeWifiSsid = "";
+  activeWifiPassword = "";
+  wifiUsingStoredCredentials = false;
+  wifiCredentialsLoaded = true;
+  wifiConnectStartedMs = 0;
+  wifiConnectFailCount = 0;
+  wifiLastFailure = "cleared";
+  Serial.println("[WiFi] Saved WiFi cleared.");
+}
+
+void autoSaveFallbackWifiAfterConnect() {
+#if WIFI_SETUP_PORTAL_ENABLED
+  if (wifiUsingStoredCredentials) return;
+  if (activeWifiSsid.length() == 0) return;
+
+  // Neu ban OTA tu ban cu sang v1.9.0, WiFi trong secrets.h se duoc luu lai 1 lan.
+  // Sau do mat dien van nho, va khi doi dia diem se co setup portal.
+  saveWifiCredentials(activeWifiSsid, activeWifiPassword);
+#endif
+}
+
+String wifiSetupPageHtml() {
+  String ssidEsc = htmlEscape(activeWifiSsid);
+  String reasonEsc = htmlEscape(wifiPortalReason);
+  String lastFailEsc = htmlEscape(wifiLastFailure);
+
+  String html;
+  html.reserve(5200);
+  html += "<!doctype html><html lang='vi'><head><meta charset='utf-8'>";
+  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>HP12 WiFi Setup</title>";
+  html += "<style>";
+  html += "body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Arial;background:linear-gradient(135deg,#061a2b,#0b6b5d);color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:18px;}";
+  html += ".card{width:100%;max-width:430px;background:rgba(255,255,255,.12);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.22);border-radius:24px;box-shadow:0 18px 50px rgba(0,0,0,.32);overflow:hidden;}";
+  html += ".top{padding:22px 24px 14px;border-bottom:1px solid rgba(255,255,255,.16)}";
+  html += "h1{margin:0;font-size:28px;letter-spacing:-.5px}.sub{margin-top:6px;color:#d6fff6;font-size:14px;line-height:1.45}.body{padding:22px 24px}.pill{display:inline-block;border:1px solid rgba(255,255,255,.35);border-radius:999px;padding:7px 11px;margin:0 6px 8px 0;font-size:13px;background:rgba(255,255,255,.1)}";
+  html += "label{display:block;margin:16px 0 7px;font-weight:650}input{width:100%;box-sizing:border-box;border:0;border-radius:14px;padding:14px 14px;font-size:16px;outline:none;background:#fff;color:#111}button{width:100%;margin-top:20px;border:0;border-radius:16px;padding:15px 18px;font-size:17px;font-weight:800;color:#08352f;background:#7fffd4;box-shadow:0 8px 20px rgba(127,255,212,.25)}";
+  html += ".hint{font-size:13px;line-height:1.55;color:#e8fffa;margin-top:16px}.steps{margin:0;padding-left:18px;color:#e8fffa}.danger{color:#ffe0e0}.ok{color:#b7ffd8}.small{font-size:12px;color:#cdeee8;margin-top:12px}";
+  html += "</style></head><body><main class='card'>";
+  html += "<section class='top'><h1>HP12 WiFi Setup</h1>";
+  html += "<div class='sub'>Thiết lập mạng cho thiết bị cảm nhận tiện nghi không gian làm việc.</div></section>";
+  html += "<section class='body'>";
+
+  if (wifiPortalSaveOk) {
+    html += "<h2 class='ok'>Đã lưu WiFi</h2>";
+    html += "<p>HP12 sẽ tự khởi động lại và kết nối vào mạng mới. Từ lần sau, kể cả mất điện, thiết bị vẫn nhớ WiFi này.</p>";
+  } else {
+    html += "<div>";
+    html += "<span class='pill'>AP: "; html += WIFI_SETUP_AP_SSID; html += "</span>";
+    html += "<span class='pill'>IP: 192.168.4.1</span>";
+    html += "</div>";
+    html += "<p class='hint'>Lý do mở cài đặt: <b>" + reasonEsc + "</b>. Lỗi gần nhất: <b>" + lastFailEsc + "</b>.</p>";
+    html += "<form method='POST' action='/save'>";
+    html += "<label>Tên WiFi mới</label><input name='ssid' required maxlength='32' placeholder='Ví dụ: My Office WiFi' value='" + ssidEsc + "'>";
+    html += "<label>Mật khẩu WiFi</label><input name='pass' type='password' maxlength='64' placeholder='Nhập mật khẩu WiFi'>";
+    html += "<button type='submit'>Lưu WiFi và khởi động lại HP12</button></form>";
+    html += "<div class='hint'><b>Hướng dẫn nhanh:</b><ol class='steps'><li>Kết nối điện thoại vào WiFi <b>HP12-SETUP</b>.</li><li>Mở trình duyệt vào <b>192.168.4.1</b>.</li><li>Nhập WiFi mới rồi bấm lưu.</li></ol></div>";
+    html += "<p class='small'>HP12 chỉ lưu tên WiFi và mật khẩu trong bộ nhớ nội bộ của ESP32, không đưa mật khẩu lên GitHub.</p>";
+  }
+
+  html += "</section></main></body></html>";
+  return html;
+}
+
+void handleWifiSetupRoot() {
+  wifiSetupServer.send(200, "text/html; charset=utf-8", wifiSetupPageHtml());
+}
+
+void handleWifiSetupSave() {
+  String ssid = wifiSetupServer.arg("ssid");
+  String pass = wifiSetupServer.arg("pass");
+  ssid.trim();
+
+  if (ssid.length() == 0) {
+    wifiSetupServer.send(400, "text/plain; charset=utf-8", "SSID không được để trống. Quay lại và nhập tên WiFi.");
+    return;
+  }
+
+  bool ok = saveWifiCredentials(ssid, pass);
+  wifiPortalSaveOk = ok;
+  wifiPortalSavedAtMs = millis();
+  wifiPortalMessage = ok ? "saved" : "save-failed";
+
+  wifiSetupServer.send(200, "text/html; charset=utf-8", wifiSetupPageHtml());
+
+  if (ok) {
+    scheduledRestartMs = millis() + WIFI_SETUP_RESTART_MS;
+    Serial.println("[WiFiSetup] WiFi saved. Restart scheduled.");
+  }
+}
+
+void handleWifiSetupNotFound() {
+  wifiSetupServer.sendHeader("Location", String("http://") + WiFi.softAPIP().toString(), true);
+  wifiSetupServer.send(302, "text/plain", "");
+}
+
+void startWifiSetupPortal(const String &reason) {
+#if WIFI_SETUP_PORTAL_ENABLED
+  if (wifiPortalActive) return;
+
+  wifiPortalReason = reason;
+  wifiPortalActive = true;
+  wifiPortalSaveOk = false;
+  wifiPortalStartedMs = millis();
+  wifiPortalMessage = "portal-active";
+  currentPage = PAGE_WIFI_SETUP;
+  resetScroll();
+
+  mqttClient.disconnect();
+  rpcSubscribed = false;
+
+  // Portal chỉ cần AP. Không dùng AP_STA để tránh STA còn đang connecting.
+  prepareWifiRadioForPortalAp();
+
+  const char* apPass = WIFI_SETUP_AP_PASSWORD;
+  bool apOk;
+  if (strlen(apPass) >= 8) apOk = WiFi.softAP(WIFI_SETUP_AP_SSID, apPass);
+  else apOk = WiFi.softAP(WIFI_SETUP_AP_SSID);
+
+  IPAddress apIp = WiFi.softAPIP();
+
+  wifiSetupDns.start(WIFI_SETUP_DNS_PORT, "*", apIp);
+
+  wifiSetupServer.on("/", HTTP_GET, handleWifiSetupRoot);
+  wifiSetupServer.on("/save", HTTP_POST, handleWifiSetupSave);
+  wifiSetupServer.onNotFound(handleWifiSetupNotFound);
+  wifiSetupServer.begin();
+
+  Serial.println("[WiFiSetup] Portal started.");
+  Serial.print("[WiFiSetup] AP OK: ");
+  Serial.println(apOk ? "YES" : "NO");
+  Serial.print("[WiFiSetup] SSID: ");
+  Serial.println(WIFI_SETUP_AP_SSID);
+  Serial.print("[WiFiSetup] Open: http://");
+  Serial.println(apIp);
+#else
+  (void)reason;
+#endif
+}
+
+void updateWifiSetupPortalNonBlocking() {
+#if WIFI_SETUP_PORTAL_ENABLED
+  if (!wifiPortalActive) return;
+
+  wifiSetupDns.processNextRequest();
+  wifiSetupServer.handleClient();
+#endif
+}
+
+void updateWifiSetupTriggerNonBlocking() {
+#if WIFI_SETUP_PORTAL_ENABLED
+  if (wifiPortalActive) return;
+
+  bool bothPressed = isNavButtonPressedRaw() && isAdviceButtonPressedRaw();
+  unsigned long now = millis();
+
+  if (bothPressed) {
+    if (wifiBothButtonHoldStartMs == 0) {
+      wifiBothButtonHoldStartMs = now;
+      wifiBothButtonHandled = false;
+    }
+
+    if (!wifiBothButtonHandled && now - wifiBothButtonHoldStartMs >= WIFI_SETUP_TRIGGER_HOLD_MS) {
+      wifiBothButtonHandled = true;
+      navButton.clickCount = 0;
+      adviceButton.clickCount = 0;
+      clearWifiCredentials();
+      startWifiSetupPortal("manual-reset");
+    }
+  } else {
+    wifiBothButtonHoldStartMs = 0;
+    wifiBothButtonHandled = false;
+  }
+#endif
+}
+
+
 String buildMqttClientId() {
   String clientId = MQTT_CLIENT_ID_PREFIX;
   clientId += WiFi.macAddress();
@@ -1611,21 +2334,92 @@ String buildMqttClientId() {
 }
 
 void updateWiFiNonBlocking() {
-  if (WiFi.status() == WL_CONNECTED) return;
+  if (wifiPortalActive) return;
+
+  if (!wifiCredentialsLoaded) {
+    loadWifiCredentials();
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiEverConnectedThisBoot) {
+      wifiEverConnectedThisBoot = true;
+      wifiConnectStartedMs = 0;
+      wifiConnectFailCount = 0;
+      wifiConnectedAtMs = millis();
+      wifiLastFailure = "none";
+      wifiLastRssi = WiFi.RSSI();
+      Serial.print("[WiFi] Connected. SSID=");
+      Serial.print(WiFi.SSID());
+      Serial.print(" | IP=");
+      Serial.print(WiFi.localIP());
+      Serial.print(" | RSSI=");
+      Serial.println(WiFi.RSSI());
+      autoSaveFallbackWifiAfterConnect();
+    }
+    return;
+  }
+
+  wifiEverConnectedThisBoot = false;
+
+  if (!hasActiveWifiCredentials()) {
+    wifiLastFailure = "no-credentials";
+    startWifiSetupPortal("first-setup");
+    return;
+  }
 
   unsigned long now = millis();
+
+  if (wifiConnectStartedMs > 0 && now - wifiConnectStartedMs >= WIFI_CONNECT_TIMEOUT_MS) {
+    wifiConnectFailCount++;
+    wifiConnectStartedMs = 0;
+    wifiLastFailure = "connect-timeout";
+
+    Serial.print("[WiFi] Connect timeout. failCount=");
+    Serial.println(wifiConnectFailCount);
+
+#if WIFI_PORTAL_ON_SSID_NOT_FOUND
+#if WIFI_ALLOW_HIDDEN_SSID
+    bool visible = true;
+#else
+    bool visible = isSavedSsidVisible(activeWifiSsid);
+#endif
+    if (!visible) {
+      wifiLastFailure = "ssid-not-found";
+      Serial.println("[WiFi] Saved SSID not visible. Opening setup portal for new location.");
+      startWifiSetupPortal("wifi-not-found");
+      return;
+    }
+#endif
+
+    if (wifiConnectFailCount >= WIFI_CONNECT_FAIL_LIMIT) {
+      wifiLastFailure = "connect-failed";
+      Serial.println("[WiFi] Fail limit reached. Opening setup portal.");
+      startWifiSetupPortal("wifi-login-failed");
+      return;
+    }
+  }
+
+  // Nếu đã phát lệnh WiFi.begin() và vẫn đang trong cửa sổ timeout, KHÔNG gọi begin() lại.
+  // Đây là chỗ sửa lỗi chính cho log: E wifi:sta is connecting, cannot set config.
+  if (wifiConnectStartedMs > 0) {
+    return;
+  }
+
   if (now - lastWifiRetryMs < WIFI_RETRY_INTERVAL_MS) return;
 
   lastWifiRetryMs = now;
+  wifiConnectStartedMs = now;
 
   Serial.print("[WiFi] Connecting to ");
-  Serial.println(WIFI_SSID);
+  Serial.print(activeWifiSsid);
+  Serial.print(" | attempt ");
+  Serial.println(wifiConnectFailCount + 1);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  stopStaConnectCleanly("before-begin");
+  prepareWifiRadioForSta();
+  delay(WIFI_BEGIN_REISSUE_GUARD_MS);
+  WiFi.begin(activeWifiSsid.c_str(), activeWifiPassword.c_str());
 }
-
 void sendDeviceAttributes() {
   if (!mqttClient.connected()) return;
 
@@ -1636,6 +2430,9 @@ void sendDeviceAttributes() {
   jsonAddString(payload, first, "deviceModel", DEVICE_MODEL);
   jsonAddString(payload, first, "firmwareVersion", FIRMWARE_VERSION);
   jsonAddString(payload, first, "ipAddress", WiFi.localIP().toString().c_str());
+  jsonAddString(payload, first, "wifiSsid", activeWifiSsid.c_str());
+  jsonAddString(payload, first, "wifiLastFailure", wifiLastFailure.c_str());
+  jsonAddString(payload, first, "wifiLastScan", wifiLastScanSummary.c_str());
   jsonAddString(payload, first, "macAddress", WiFi.macAddress().c_str());
   jsonAddString(payload, first, "resetReason", resetReasonText(esp_reset_reason()));
   jsonAddBool(payload, first, "lightSensorEnabled", LIGHT_SENSOR_ENABLED);
@@ -1646,6 +2443,8 @@ void sendDeviceAttributes() {
   jsonAddString(payload, first, "rpcMethods", "getStatus,getTelemetry,muteAlarm,setAlarmProfile,setTelemetryInterval,restart,updateFirmware");
   jsonAddBool(payload, first, "otaEnabled", OTA_ENABLED);
   jsonAddString(payload, first, "otaMode", "rpc-updateFirmware-https-url");
+  jsonAddBool(payload, first, "wifiSetupPortalEnabled", WIFI_SETUP_PORTAL_ENABLED);
+  jsonAddBool(payload, first, "wifiUsingStoredCredentials", wifiUsingStoredCredentials);
 
   payload += "}";
 
@@ -1744,6 +2543,7 @@ String buildTelemetryPayload() {
 
   jsonAddInt(payload, first, "uptimeSec", millis() / 1000);
   jsonAddInt(payload, first, "wifiRssi", WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -999);
+  jsonAddBool(payload, first, "wifiPortalActive", wifiPortalActive);
   jsonAddInt(payload, first, "freeHeap", ESP.getFreeHeap());
 
   payload += "}";
@@ -1786,7 +2586,7 @@ void sendTelemetryNow(const char* reason) {
 // - setAlarmProfile
 // - setTelemetryInterval
 // - restart
-// - updateFirmware: chi tra loi "OTA chua bat", OTA lam o v1.8.0
+// - updateFirmware: chi tra loi "OTA chua bat", OTA bridge da co tu v1.8.x
 
 void markRpcResult(const char* method, const char* result) {
   lastRpcMethod = method;
@@ -2043,7 +2843,9 @@ void setOtaError(const String &errorText) {
   Serial.print("[OTA] ERROR: ");
   Serial.println(errorText);
 
+  drawOtaScreenNow("OTA bi loi", errorText.c_str(), "Kiem tra URL .bin");
   sendTelemetryNow("ota-error");
+  delay(OTA_OLED_ERROR_HOLD_MS);
 }
 
 void handleRpcUpdateFirmware(const String &requestId, const String &paramsRaw) {
@@ -2059,6 +2861,12 @@ void handleRpcUpdateFirmware(const String &requestId, const String &paramsRaw) {
   if (url.length() == 0 || !isOtaUrlAllowed(url)) {
     markRpcResult("updateFirmware", "bad-url");
     sendRpcResponse(requestId, "{\"success\":false,\"message\":\"missing or invalid firmware url. Use HTTPS url\"}");
+    return;
+  }
+
+  if (version.length() && version == FIRMWARE_VERSION) {
+    markRpcResult("updateFirmware", "same-version");
+    sendRpcResponse(requestId, "{\"success\":false,\"message\":\"device already runs this firmware version\"}");
     return;
   }
 
@@ -2179,6 +2987,8 @@ bool performOtaUpdate(const String &firmwareUrl) {
   otaPending = false;
   otaLastError = "";
 
+  drawOtaScreenNow("Dang tai firmware", otaTargetVersion.c_str(), "Trang thai: download");
+
   Serial.println("[OTA] Starting firmware update...");
   Serial.print("[OTA] URL: ");
   Serial.println(firmwareUrl);
@@ -2215,6 +3025,9 @@ bool performOtaUpdate(const String &firmwareUrl) {
 
   Serial.print("[OTA] Content-Length: ");
   Serial.println(contentLength);
+
+  otaStatus = "writing";
+  drawOtaScreenNow("Dang ghi firmware", otaTargetVersion.c_str(), "Trang thai: write");
 
   if (!Update.begin(contentLength > 0 ? contentLength : UPDATE_SIZE_UNKNOWN)) {
     String err = "update-begin-failed:";
@@ -2265,9 +3078,10 @@ bool performOtaUpdate(const String &firmwareUrl) {
   markRpcResult("updateFirmware", "success");
 
   Serial.println("[OTA] Update success. Restarting...");
+  drawOtaScreenNow("Cap nhat thanh cong", otaTargetVersion.c_str(), "Dang reset HP12...");
   sendTelemetryNow("ota-success");
 
-  delay(OTA_RESTART_DELAY_MS);
+  delay(OTA_OLED_SUCCESS_HOLD_MS);
   ESP.restart();
 
   return true;
@@ -2310,6 +3124,11 @@ void sendTelemetryNonBlocking() {
 }
 
 void updateCloudNonBlocking() {
+  updateWifiSetupPortalNonBlocking();
+
+  // Khi dang o portal cai WiFi, khong thu MQTT de tranh gay roi va tranh spam.
+  if (wifiPortalActive) return;
+
   updateWiFiNonBlocking();
   updateMqttNonBlocking();
 
@@ -2349,9 +3168,9 @@ void setup() {
   analogSetPinAttenuation(LIGHT_AO_PIN, ADC_11db);
 #endif
 
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
+  prepareWifiRadioForSta();
+  loadWifiCredentials();
 
   mqttClient.setServer(TB_HOST, TB_PORT);
   mqttClient.setCallback(onMqttMessage);
@@ -2373,10 +3192,19 @@ void setup() {
     showBootScreen();
   }
 
+#if WIFI_SETUP_PORTAL_ENABLED
+  // Neu khong co WiFi hop le thi mo portal ngay trong setup,
+  // khong de nguoi dung nhin thay dashboard binh thuong roi bo qua buoc cai WiFi.
+  if (!hasActiveWifiCredentials()) {
+    wifiLastFailure = "no-credentials";
+    startWifiSetupPortal("first-setup");
+  }
+#endif
+
   Serial.println("====================================");
   Serial.print("HP12 ");
   Serial.print(FIRMWARE_VERSION);
-  Serial.println(" OTA UPDATE BRIDGE started.");
+  Serial.println(" DEEPWORK TROPICAL WIFI STABLE started.");
   Serial.print("DHT PIN: GPIO");
   Serial.println(DHT_PIN);
   Serial.print("LIGHT AO PIN: GPIO");
@@ -2390,6 +3218,8 @@ void setup() {
   Serial.println("Blue LED self-test: first 8 seconds.");
   Serial.println("Basis: Temp + RH + Heat Index + relative light; proxy only.");
   Serial.println("Cloud: WiFi + MQTT ThingsBoard non-blocking, anti-spam telemetry.");
+  Serial.println("WiFi setup: old WiFi remembered, new location opens HP12-SETUP with OLED guidance.");
+  Serial.println("Hold NAV + ADVICE for 5.5s to reset WiFi and open setup portal.");
   Serial.println("Telemetry interval: 30 seconds + force first sync.");
   Serial.println("====================================");
 }
@@ -2399,7 +3229,10 @@ void setup() {
 // =========================
 
 void loop() {
-  updateButtonsNonBlocking();
+  updateWifiSetupTriggerNonBlocking();
+  if (!wifiPortalActive) {
+    updateButtonsNonBlocking();
+  }
   readSensorNonBlocking();
   readLightNonBlocking();
   updateOledNonBlocking();
