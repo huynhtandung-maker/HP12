@@ -1,62 +1,33 @@
 # HP12 - Workspace Comfort IoT Device
 
-HP12 is an ESP32-based IoT device for monitoring workspace comfort in real time.
+HP12 là thiết bị IoT dùng ESP32 để theo dõi chất lượng không gian làm việc: nhiệt độ, độ ẩm, heat index, ánh sáng tương đối, trạng thái WiFi và kết nối ThingsBoard.
 
-The device measures temperature, humidity, heat index and relative light level, then sends telemetry to ThingsBoard for dashboard tracking. It also provides local feedback through OLED display, LEDs, buzzer and physical buttons.
+Mục tiêu của HP12 là giúp đánh giá không gian có đang hỗ trợ hay đang làm giảm khả năng tập trung sâu hay không.
 
-## Core Purpose
+## Dùng nhanh
 
-HP12 helps answer one practical question:
+1. Cấp nguồn cho HP12.
+2. Xem trạng thái trên màn hình OLED.
+3. Bấm `NAV` để chuyển tab màn hình.
+4. Bấm `ADVICE` để xem khuyến nghị.
+5. Muốn đổi WiFi, giữ `NAV + ADVICE` trong khoảng 5.5 giây.
+6. Kết nối điện thoại vào `HP12-SETUP`.
+7. Mở `http://192.168.4.1`.
+8. Chọn WiFi 2.4GHz đủ mạnh, nhập mật khẩu và lưu.
 
-> Is this workspace supporting or hurting deep focus right now?
+## Tài liệu hướng dẫn
 
-## Hardware
+- [Hướng dẫn sử dụng](docs/USER_GUIDE.md)
+- [Hướng dẫn cài đặt WiFi](docs/WIFI_SETUP_GUIDE.md)
+- [Lỗi thường gặp](docs/TROUBLESHOOTING.md)
+- [Hướng dẫn cập nhật OTA](docs/OTA_GUIDE.md)
 
-- ESP32 / ESP32-U
-- DHT22 temperature & humidity sensor
-- LDR light sensor module
-- OLED 0.96 inch SSD1306 I2C
-- Green / Yellow / Red status LEDs
-- Buzzer
-- Navigation button
-- Advice button
+## Lưu ý bảo mật
 
-## Main Features
+Không upload các file chứa thông tin nhạy cảm:
 
-- Real-time temperature and humidity reading
-- Heat Index / perceived temperature estimation
-- Relative light level monitoring
-- Focus proxy score
-- OLED local dashboard
-- LED and buzzer alert patterns
-- ThingsBoard MQTT telemetry
-- Non-blocking WiFi/MQTT reconnect
-- Force first telemetry sync after connection
-- Secrets separated from GitHub
+- `secrets.h`
+- mật khẩu WiFi thật
+- ThingsBoard Access Token thật
 
-## ThingsBoard Telemetry
-
-HP12 sends:
-
-- temperature
-- humidity
-- heatIndex
-- lightPercent
-- focusScore
-- comfortState
-- thermalState
-- lightState
-- action
-- alarmProfile
-- alarmMuted
-- uptimeSec
-- wifiRssi
-- freeHeap
-
-## File Structure
-
-```text
-HP12/
-├─ HP12.ino
-├─ config.h
-└─ secrets.example.h
+Chỉ dùng `secrets.example.h` để làm mẫu cấu hình.
