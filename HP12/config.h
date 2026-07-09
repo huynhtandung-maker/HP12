@@ -27,7 +27,7 @@
 // ============================================================================
 #define DEVICE_NAME        "HP12_Edge"
 #define DEVICE_MODEL       "PCODE_DataNode_V1"
-#define FIRMWARE_VERSION   "v1.13.16" // OTA-safe WiFi boot + stable RPC OTA + phone-first setup
+#define FIRMWARE_VERSION   "v1.13.19" // WiFi Identity + IP-location clarity on OLED/ThingsBoard
 
 
 // ============================================================================
@@ -105,7 +105,8 @@
 #define WIFI_SETUP_PREF_NAMESPACE    "hp12wifi"
 #define WIFI_SETUP_RESTART_MS        2500UL
 #define WIFI_SETUP_TRIGGER_HOLD_MS   5500UL      // Giữ cả NAV + ADVICE để xóa WiFi cũ
-#define WIFI_SETUP_SINGLE_HOLD_MS    8500UL      // Fallback: giữ riêng NAV hoặc ADVICE 8.5s để mở setup khi khó bấm 2 nút
+#define WIFI_SETUP_SINGLE_HOLD_MS    8500UL      // Fallback optional: giữ riêng NAV hoặc ADVICE 8.5s để mở setup
+#define WIFI_SETUP_SINGLE_HOLD_ENABLED 0          // 0 = giữ nguyên chức năng click/long-press của từng nút OLED; setup chính dùng NAV+ADVICE
 #define WIFI_SERIAL_COMMAND_ENABLED  1           // Cho phép gõ SETUP / RESETWIFI trong Serial Monitor để mở portal
 
 // WiFi hardening: tránh lỗi ESP32 "sta is connecting, cannot set config"
@@ -133,6 +134,21 @@
 #define WIFI_PORTAL_SCAN_MAX_ITEMS   12
 #define WIFI_PORTAL_USE_GET_SAVE     1           // Hỗ trợ lưu bằng GET + POST để captive browser trên điện thoại ít lỗi submit hơn
 #define WIFI_PORTAL_PRINT_CLIENT_DIAGNOSTICS_MS 8000UL // In số điện thoại đang bám AP để chẩn đoán setup
+
+// --- WiFi Doctor UX: chuẩn hóa trải nghiệm cấu hình WiFi cho người dùng phổ thông ---
+// ESP32 cần sóng mạnh hơn điện thoại. Không cho lưu mặc định các WiFi quá yếu để tránh vòng lặp setup.
+#define WIFI_IOT_EXCELLENT_RSSI_DBM       -55
+#define WIFI_IOT_GOOD_RSSI_DBM            -67
+#define WIFI_IOT_ACCEPTABLE_RSSI_DBM      -75
+#define WIFI_IOT_WEAK_RSSI_DBM            -82
+#define WIFI_IOT_BLOCK_RSSI_DBM           -83
+#define WIFI_PORTAL_BLOCK_WEAK_WIFI       1
+#define WIFI_PORTAL_ALLOW_FORCE_WEAK      1
+#define WIFI_PORTAL_VALIDATE_SCAN_BEFORE_SAVE 1
+
+// OLED WiFi UX v1.13.19
+#define WIFI_OLED_SHOW_CONNECTED_SSID 1          // Hiển thị tên WiFi đang kết nối thay vì chỉ CONNECTED
+#define WIFI_LOCATION_SHOW_IP_BASIS   1          // Gửi rõ locationBasis/locationConfidence/locationSummary lên ThingsBoard
 
 // --- OTA-safe WiFi boot ---
 // Sau khi OTA thành công, boot kế tiếp phải ưu tiên reconnect WiFi cũ để quay lại ThingsBoard,

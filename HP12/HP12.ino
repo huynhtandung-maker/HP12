@@ -1,7 +1,7 @@
 /*
   =============================================================================
   PCODE HP12 - DATA INTELLIGENCE EDITION
-  Firmware: v1.13.16 Tropical Deep Work + OTA-Safe WiFi Boot
+  Firmware: v1.13.19 WiFi Identity + IP Location Clarity
   Board   : ESP32 30 pin / ESP32-WROOM compatible
   Sensor  : DHT22 + LDR LM393
   Display : OLED SSD1306 128x64 I2C
@@ -23,7 +23,7 @@
     #define TB_HOST                "thingsboard.cloud"
     #define TB_PORT                1883
     #define TB_TOKEN               "YOUR_DEVICE_ACCESS_TOKEN"
-    // v1.13.14 supports runtime token stored in Preferences or a local secrets.h. No factory token is embedded.
+    // v1.13.19 adds OLED WiFi identity and clearer IP-location status; no factory token is embedded.
   =============================================================================
 */
 
@@ -141,6 +141,30 @@
 #endif
 #ifndef WIFI_PORTAL_REFRESH_SCAN_MS
   #define WIFI_PORTAL_REFRESH_SCAN_MS 45000UL
+#endif
+#ifndef WIFI_IOT_EXCELLENT_RSSI_DBM
+  #define WIFI_IOT_EXCELLENT_RSSI_DBM -55
+#endif
+#ifndef WIFI_IOT_GOOD_RSSI_DBM
+  #define WIFI_IOT_GOOD_RSSI_DBM -67
+#endif
+#ifndef WIFI_IOT_ACCEPTABLE_RSSI_DBM
+  #define WIFI_IOT_ACCEPTABLE_RSSI_DBM -75
+#endif
+#ifndef WIFI_IOT_WEAK_RSSI_DBM
+  #define WIFI_IOT_WEAK_RSSI_DBM -82
+#endif
+#ifndef WIFI_IOT_BLOCK_RSSI_DBM
+  #define WIFI_IOT_BLOCK_RSSI_DBM -83
+#endif
+#ifndef WIFI_PORTAL_BLOCK_WEAK_WIFI
+  #define WIFI_PORTAL_BLOCK_WEAK_WIFI 1
+#endif
+#ifndef WIFI_PORTAL_ALLOW_FORCE_WEAK
+  #define WIFI_PORTAL_ALLOW_FORCE_WEAK 1
+#endif
+#ifndef WIFI_PORTAL_VALIDATE_SCAN_BEFORE_SAVE
+  #define WIFI_PORTAL_VALIDATE_SCAN_BEFORE_SAVE 1
 #endif
 #ifndef TELEMETRY_INTERVAL_MIN_MS
   #define TELEMETRY_INTERVAL_MIN_MS 15000UL
@@ -358,6 +382,12 @@ bool wifiSinglePortalTriggered = false;
 int wifiLastBestRssiDbm = -999;
 String wifiLastScanSummary = "not-scanned";
 String wifiLastStatusText = "init";
+String wifiPortalStepText = "";
+String wifiPortalUserHint = "";
+int wifiPortalCandidateRssiDbm = -999;
+String wifiPortalScannedSsids[WIFI_PORTAL_SCAN_MAX_ITEMS];
+int wifiPortalScannedRssis[WIFI_PORTAL_SCAN_MAX_ITEMS];
+int wifiPortalScannedCount = 0;
 unsigned long wifiConnectedSinceMs = 0;
 bool otaSafeWifiBoot = false;
 unsigned long otaSafeWifiUntilMs = 0;
@@ -376,6 +406,7 @@ String locationProvider = "none";
 String locationFetchStatus = "not-started";
 String locationWifiFingerprint = "";
 unsigned long lastLocationAttemptMs = 0;
+unsigned long locationLastSuccessMs = 0;
 unsigned int locationFetchAttempt = 0;
 
 // MQTT / RPC / OTA state
@@ -780,6 +811,79 @@ int scanBestRssiForSsid(const String &ssid) {
 #endif
 }
 
+
+const char* wifiDoctorRssiLabel(int rssi) {
+  if (rssi <= -998) return "KHONG THAY";
+  if (rssi >= WIFI_IOT_EXCELLENT_RSSI_DBM) return "RAT MANH";
+  if (rssi >= WIFI_IOT_GOOD_RSSI_DBM) return "TOT";
+  if (rssi >= WIFI_IOT_ACCEPTABLE_RSSI_DBM) return "ON DINH";
+  if (rssi >= WIFI_IOT_WEAK_RSSI_DBM) return "YEU";
+  return "QUA YEU";
+}
+
+const char* wifiDoctorCssClass(int rssi) {
+  if (rssi <= -998) return "badnet";
+  if (rssi >= WIFI_IOT_GOOD_RSSI_DBM) return "goodnet";
+  if (rssi >= WIFI_IOT_ACCEPTABLE_RSSI_DBM) return "oknet";
+  if (rssi >= WIFI_IOT_WEAK_RSSI_DBM) return "warnnet";
+  return "badnet";
+}
+
+String wifiDoctorHumanAdvice(int rssi) {
+  if (rssi <= -998) return "HP12 khong thay WiFi nay tren 2.4GHz. Hay chon WiFi khac hoac dua thiet bi gan router hon.";
+  if (rssi >= WIFI_IOT_GOOD_RSSI_DBM) return "Tin hieu tot cho IoT. Co the ket noi.";
+  if (rssi >= WIFI_IOT_ACCEPTABLE_RSSI_DBM) return "Tin hieu chap nhan duoc. Co the ket noi, nhung nen dat HP12 thoang hon.";
+  if (rssi >= WIFI_IOT_WEAK_RSSI_DBM) return "Tin hieu yeu. Van co the thu, nhung khong khuyen nghi cho lap dat co dinh.";
+  return "Tin hieu qua yeu doi voi ESP32. Dien thoai co the vao duoc nhung HP12 rat de fail. Hay chon WiFi manh hon hoac dua thiet bi gan router.";
+}
+
+bool wifiDoctorShouldBlockRssi(int rssi) {
+#if WIFI_PORTAL_BLOCK_WEAK_WIFI
+  return (rssi <= -998) || (rssi <= WIFI_IOT_BLOCK_RSSI_DBM);
+#else
+  (void)rssi;
+  return false;
+#endif
+}
+
+int lookupPortalCachedRssiForSsid(const String &ssid) {
+  int best = -999;
+  for (int i = 0; i < wifiPortalScannedCount && i < WIFI_PORTAL_SCAN_MAX_ITEMS; i++) {
+    if (wifiPortalScannedSsids[i] == ssid && wifiPortalScannedRssis[i] > best) best = wifiPortalScannedRssis[i];
+  }
+  return best;
+}
+
+int scanRssiForSetupCandidate(const String &ssid) {
+  if (ssid.length() == 0) return -999;
+  Serial.print("[WiFiDoctor] Validate SSID before save: ");
+  Serial.println(ssid);
+  if (wifiPortalActive) WiFi.mode(WIFI_AP_STA);
+  else WiFi.mode(WIFI_STA);
+  applyWifiStabilityTuning();
+  delay(120);
+  int n = WiFi.scanNetworks(false, true);
+  int best = -999;
+  if (n > 0) {
+    for (int i = 0; i < n; i++) {
+      String found = WiFi.SSID(i);
+      if (found == ssid && WiFi.RSSI(i) > best) best = WiFi.RSSI(i);
+    }
+  }
+  WiFi.scanDelete();
+#if WIFI_SETUP_FORCE_AP_ONLY
+  if (wifiPortalActive) {
+    WiFi.mode(WIFI_AP);
+    applyWifiStabilityTuning();
+  }
+#endif
+  Serial.print("[WiFiDoctor] Candidate RSSI=");
+  Serial.print(best);
+  Serial.print(" dBm | label=");
+  Serial.println(wifiDoctorRssiLabel(best));
+  return best;
+}
+
 int wifiSignalQualityPercent() {
   if (WiFi.status() != WL_CONNECTED) return 0;
   long rssi = WiFi.RSSI();
@@ -1113,6 +1217,83 @@ void readLightNonBlocking() {
 #endif
 }
 
+
+// ============================================================================
+// WiFi identity + IP-location display helpers (v1.13.19)
+// ============================================================================
+String shortOledText(String s, uint8_t maxChars) {
+  s.trim();
+  if (maxChars == 0) return "";
+  if (s.length() <= maxChars) return s;
+  if (maxChars <= 1) return s.substring(0, maxChars);
+  return s.substring(0, maxChars - 1) + "~";
+}
+
+String wifiConnectedSsidText() {
+  String s = "";
+  if (WiFi.status() == WL_CONNECTED) s = WiFi.SSID();
+  if (s.length() == 0) s = activeWifiSsid;
+  if (s.length() == 0) s = savedWifiSsid;
+  if (s.length() == 0) s = "unknown";
+  return s;
+}
+
+String wifiConnectedBssidText() {
+  if (WiFi.status() == WL_CONNECTED) return WiFi.BSSIDstr();
+  return "";
+}
+
+String locationConfidenceText() {
+  if (locationFetchStatus == "success" && locationSource == "ip") return "ip-city-level";
+  if (WiFi.status() != WL_CONNECTED) return "offline";
+  if (locationSource == "pending-ip" || locationFetchStatus.endsWith("pending")) return "pending-refresh";
+  if (locationSource == "default" || locationProvider == "configured-fallback") return "fallback-not-current";
+  if (locationFetchStatus == "disabled") return "disabled";
+  return "retrying";
+}
+
+String locationSummaryText() {
+  String c = locationConfidenceText();
+  if (c == "ip-city-level") {
+    String s = "IP loc: ";
+    s += ipCity.length() ? ipCity : "city?";
+    if (ipCountryCode.length()) { s += ","; s += ipCountryCode; }
+    s += " via "; s += locationProvider;
+    if (publicIp.length()) { s += " "; s += publicIp; }
+    return s;
+  }
+  if (c == "pending-refresh") return "IP loc: dang cap nhat theo WiFi moi";
+  if (c == "fallback-not-current") return "IP loc: tam dung fallback, chua phai vi tri WiFi hien tai";
+  if (c == "offline") return "IP loc: offline";
+  if (c == "disabled") return "IP loc: disabled";
+  return String("IP loc: retry ") + locationFetchStatus;
+}
+
+String locationOledShortText() {
+  String c = locationConfidenceText();
+  if (c == "ip-city-level") {
+    String s = "LOC:";
+    s += ipCity.length() ? ipCity : "OK";
+    if (publicIp.length()) { s += " "; s += publicIp; }
+    return shortOledText(s, 21);
+  }
+  if (c == "pending-refresh") return "LOC:dang cap nhat";
+  if (c == "fallback-not-current") return "LOC:fallback tam";
+  if (c == "offline") return "LOC:offline";
+  if (c == "disabled") return "LOC:off";
+  return shortOledText(String("LOC:retry ") + locationFetchStatus, 21);
+}
+
+String wifiOledSignalText() {
+  if (WiFi.status() != WL_CONNECTED) return "R:-999 Q:0%";
+  String s = "R:";
+  s += String(WiFi.RSSI());
+  s += " Q:";
+  s += String(wifiSignalQualityPercent());
+  s += "%";
+  return s;
+}
+
 // ============================================================================
 // OLED UI
 // ============================================================================
@@ -1177,7 +1358,7 @@ void drawHomePage() {
 
   if (wifiPortalActive) {
     display.setCursor(0, 15); display.print("WIFI SETUP PORTAL");
-    display.setCursor(0, 28); display.print("SSID: "); display.print(WIFI_SETUP_AP_SSID);
+    display.setCursor(0, 28); display.print("AP: "); { String ap = wifiPortalApSsid.length() ? wifiPortalApSsid : String(WIFI_SETUP_AP_SSID); printClippedText(ap.c_str(), 22, 28, 106); }
     display.setCursor(0, 41); display.print("IP: 192.168.4.1");
     return;
   }
@@ -1291,22 +1472,50 @@ void drawBasisPage() {
 void drawWifiPage() {
   display.setCursor(0, 0); display.print("MANG KET NOI");
   display.drawLine(0, 11, 127, 11, SSD1306_WHITE);
-  display.setCursor(0, 15);
-  if (wifiPortalActive) display.print("Portal: ACTIVE");
-  else if (WiFi.status() == WL_CONNECTED) display.print("WiFi: CONNECTED");
-  else display.print("WiFi: OFFLINE");
 
-  display.setCursor(0, 28);
-  if (WiFi.status() == WL_CONNECTED) {
-    display.print("IP:"); display.print(WiFi.localIP());
-  } else {
-    display.print("Fail:"); printClippedText(wifiLastFailure.c_str(), 34, 28, 94);
+  if (wifiPortalActive) {
+    display.setCursor(0, 15); display.print("Portal: ACTIVE");
+    display.setCursor(0, 27);
+    printClippedText(wifiPortalStepText.length() ? wifiPortalStepText.c_str() : "Mo 192.168.4.1", 0, 27, 126);
+    display.setCursor(0, 39);
+    display.print("AP:");
+    String ap = wifiPortalApSsid.length() ? wifiPortalApSsid : String(WIFI_SETUP_AP_SSID);
+    printClippedText(ap.c_str(), 18, 39, 110);
+    display.setCursor(0, 50);
+    display.print("Client:"); display.print(WiFi.softAPgetStationNum()); display.print(" IP:4.1");
+    return;
   }
 
+  if (WiFi.status() == WL_CONNECTED) {
+    String ssid = wifiConnectedSsidText();
+    display.setCursor(0, 15);
+    display.print("SSID:");
+    printClippedText(ssid.c_str(), 30, 15, 98);
+
+    display.setCursor(0, 27);
+    display.print("IP:");
+    String ip = WiFi.localIP().toString();
+    printClippedText(ip.c_str(), 18, 27, 110);
+
+    display.setCursor(0, 39);
+    String sig = wifiOledSignalText();
+    display.print(sig);
+    display.print(" M:");
+    display.print(mqttClient.connected() ? "OK" : "NO");
+
+    display.setCursor(0, 50);
+    String loc = locationOledShortText();
+    printClippedText(loc.c_str(), 0, 50, 126);
+    return;
+  }
+
+  display.setCursor(0, 15); display.print("WiFi: OFFLINE");
+  display.setCursor(0, 28);
+  display.print("Fail:"); printClippedText(wifiLastFailure.c_str(), 34, 28, 94);
   display.setCursor(0, 41);
-  display.print("MQTT:"); display.print(mqttClient.connected() ? "OK" : "NO");
-  display.print(" RSSI:");
-  display.print(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -999);
+  display.print("Last:"); printClippedText(activeWifiSsid.c_str(), 30, 41, 98);
+  display.setCursor(0, 52);
+  display.print("Hold 2 nut: setup");
 }
 
 void drawHelpPage() {
@@ -1647,7 +1856,10 @@ void updateWifiSetupTriggerNonBlocking() {
   bothButtonsHoldStartedMs = 0;
   wifiResetPortalTriggered = false;
 
-  // Fallback thực địa: nếu 1 nút khó bấm/chập chờn, giữ riêng NAV hoặc ADVICE 8.5s cũng mở setup.
+  // Fallback thực địa: giữ riêng NAV hoặc ADVICE 8.5s để mở setup.
+  // Mặc định TẮT vì nó xung đột với thao tác click/long-press dùng để chuyển tab OLED.
+  // Khi cần bật lại, set WIFI_SETUP_SINGLE_HOLD_ENABLED = 1 trong config.h.
+#if defined(WIFI_SETUP_SINGLE_HOLD_ENABLED) && WIFI_SETUP_SINGLE_HOLD_ENABLED
   if (navPressed || advPressed) {
     uint8_t which = navPressed ? 1 : 2;
     if (singleButtonHoldStartedMs == 0 || singleButtonHoldWhich != which) {
@@ -1664,6 +1876,7 @@ void updateWifiSetupTriggerNonBlocking() {
     }
     return;
   }
+#endif
 
   singleButtonHoldStartedMs = 0;
   singleButtonHoldWhich = 0;
@@ -1673,8 +1886,13 @@ void updateWifiSetupTriggerNonBlocking() {
 
 void updateButtonsNonBlocking() {
   if (wifiPortalActive) return;
-  if (bothButtonsHoldStartedMs > 0) return;
-  if (singleButtonHoldStartedMs > 0) return;
+
+  // Chỉ khóa xử lý click thường khi người dùng đang giữ ĐỒNG THỜI NAV+ADVICE để vào setup.
+  // Không khóa khi chỉ nhấn một nút, nếu không NAV/ADVICE sẽ không còn chuyển tab OLED được.
+  bool navPressed = buttonRawPressed(navButton);
+  bool advPressed = buttonRawPressed(adviceButton);
+  if (navPressed && advPressed) return;
+
   updateButton(navButton, handleNavClicks, handleNavLongPress);
   updateButton(adviceButton, handleAdviceClicks, handleAdviceLongPress);
 }
@@ -1801,7 +2019,8 @@ String effectivePortalApPassword() {
 String buildPortalScanListHtml() {
 #if WIFI_PORTAL_SCAN_LIST_ENABLED
   Serial.println("[WiFiSetup] Scanning nearby WiFi for phone setup page...");
-  WiFi.mode(WIFI_STA);
+  if (wifiPortalActive) WiFi.mode(WIFI_AP_STA);
+  else WiFi.mode(WIFI_STA);
   applyWifiStabilityTuning();
   delay(120);
   int n = WiFi.scanNetworks(false, true); // sync scan; include hidden; ESP32 = 2.4GHz only
@@ -1834,7 +2053,7 @@ String buildPortalScanListHtml() {
       int pos = count < maxItems ? count++ : maxItems - 1;
       ssids[pos] = ssid; rssis[pos] = rssi; encs[pos] = enc;
 
-      // Bubble the inserted item up so the list is roughly sorted by signal strength.
+      // Sort roughly by strongest RSSI.
       for (int a = pos; a > 0 && rssis[a] > rssis[a - 1]; a--) {
         String ts = ssids[a - 1]; ssids[a - 1] = ssids[a]; ssids[a] = ts;
         int tr = rssis[a - 1]; rssis[a - 1] = rssis[a]; rssis[a] = tr;
@@ -1843,16 +2062,47 @@ String buildPortalScanListHtml() {
     }
   }
 
+  wifiPortalScannedCount = count;
+  for (int i = 0; i < WIFI_PORTAL_SCAN_MAX_ITEMS; i++) {
+    if (i < count) { wifiPortalScannedSsids[i] = ssids[i]; wifiPortalScannedRssis[i] = rssis[i]; }
+    else { wifiPortalScannedSsids[i] = ""; wifiPortalScannedRssis[i] = -999; }
+  }
+
   String html;
-  html.reserve(2200);
-  html += "<div class='netbox'><b>WiFi gan day quet duoc tren 2.4GHz</b>";
+  html.reserve(4200);
+  html += "<div class='netbox'><b>WiFi 2.4GHz gan HP12</b>";
+  html += "<p class='hint'>HP12 dung anten nho hon dien thoai. Nen chon WiFi <b>tu ";
+  html += String(WIFI_IOT_ACCEPTABLE_RSSI_DBM);
+  html += " dBm tro len</b>. Duoi ";
+  html += String(WIFI_IOT_BLOCK_RSSI_DBM);
+  html += " dBm se bi chan de tranh vong lap setup.</p>";
+
   if (count == 0) {
-    html += "<p class='hint bad'>Chua quet thay WiFi 2.4GHz nao. Hay dua HP12 gan router hon, hoac dam bao router co bat 2.4GHz.</p>";
+    html += "<p class='hint bad'>Khong thay WiFi 2.4GHz nao. Hay dua HP12 gan router hon, hoac dam bao router co bat 2.4GHz/WPA2.</p>";
   } else {
-    html += "<p class='hint'>Bam ten WiFi de dua vao form, sau do nhap mat khau va bam Luu. Day KHONG phai thao tac chuyen WiFi cua dien thoai.</p>";
+    int bestOk = -1;
+    for (int i = 0; i < count; i++) {
+      if (rssis[i] >= WIFI_IOT_ACCEPTABLE_RSSI_DBM) { bestOk = i; break; }
+    }
+    if (bestOk >= 0) {
+      html += "<p class='recommend'>Khuyen nghi: <b>";
+      html += htmlEscape(ssids[bestOk]);
+      html += "</b> (";
+      html += String(rssis[bestOk]);
+      html += " dBm - ";
+      html += wifiDoctorRssiLabel(rssis[bestOk]);
+      html += ").</p>";
+    } else {
+      html += "<p class='recommend bad'>Chua co WiFi nao dat nguong IoT on dinh. Hay doi vi tri HP12/gian day anten/gan router hon.</p>";
+    }
+
     for (int i = 0; i < count; i++) {
       String sec = (encs[i] == WIFI_AUTH_OPEN) ? "OPEN" : "WPA";
-      html += "<a class='net' href='/?ssid=";
+      bool blocked = wifiDoctorShouldBlockRssi(rssis[i]);
+      html += "<a class='net ";
+      html += wifiDoctorCssClass(rssis[i]);
+      if (blocked) html += " blocked";
+      html += "' href='/?ssid=";
       html += urlEncode(ssids[i]);
       html += "' onclick=\"return pick('";
       html += jsEscape(ssids[i]);
@@ -1862,11 +2112,20 @@ String buildPortalScanListHtml() {
       html += String(rssis[i]);
       html += " dBm · ";
       html += sec;
+      html += " · ";
+      html += wifiDoctorRssiLabel(rssis[i]);
+      if (blocked) html += " · KHONG KHUYEN NGHI";
       html += "</span></a>";
     }
   }
   html += "</div>";
   WiFi.scanDelete();
+#if WIFI_SETUP_FORCE_AP_ONLY
+  if (wifiPortalActive) {
+    WiFi.mode(WIFI_AP);
+    applyWifiStabilityTuning();
+  }
+#endif
   return html;
 #else
   return String("");
@@ -1880,14 +2139,14 @@ String portalPageHtml(const String &message = "") {
   String apName = wifiPortalApSsid.length() ? wifiPortalApSsid : String(WIFI_SETUP_AP_SSID);
   String apPass = wifiPortalApPassword;
   String html;
-  html.reserve(9800);
+  html.reserve(13500);
   html += "<!doctype html><html lang='vi'><head><meta charset='utf-8'>";
   html += "<meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1'>";
   html += "<meta http-equiv='Cache-Control' content='no-store'>";
   html += "<title>HP12 WiFi Setup</title>";
   html += "<style>";
   html += "body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Arial;background:#071b2a;color:#fff;min-height:100vh;padding:14px;}";
-  html += ".wrap{max-width:520px;margin:0 auto}.card{background:linear-gradient(145deg,rgba(7,107,93,.96),rgba(6,26,43,.96));border:1px solid rgba(255,255,255,.22);border-radius:22px;box-shadow:0 18px 45px rgba(0,0,0,.35);overflow:hidden}.top{padding:20px 20px 12px;border-bottom:1px solid rgba(255,255,255,.15)}h1{margin:0;font-size:27px}.sub{margin-top:8px;color:#d6fff6;font-size:14px;line-height:1.48}.body{padding:18px 20px}.step{display:flex;gap:10px;align-items:flex-start;margin:11px 0;padding:12px;border-radius:14px;background:rgba(255,255,255,.11)}.num{flex:0 0 28px;height:28px;border-radius:50%;background:#7fffd4;color:#07342f;font-weight:900;display:flex;align-items:center;justify-content:center}.txt{font-size:14px;line-height:1.45}.pill{display:inline-block;border:1px solid rgba(255,255,255,.35);border-radius:999px;padding:7px 10px;margin:0 5px 8px 0;font-size:13px;background:rgba(255,255,255,.1)}label{display:block;margin:14px 0 7px;font-weight:800}input{width:100%;box-sizing:border-box;border:0;border-radius:13px;padding:14px;font-size:17px;outline:none;background:#fff;color:#111}.row{display:grid;grid-template-columns:1fr;gap:10px}button,.btn{display:block;width:100%;box-sizing:border-box;text-align:center;text-decoration:none;margin-top:14px;border:0;border-radius:15px;padding:15px 16px;font-size:17px;font-weight:900;color:#08352f;background:#7fffd4;box-shadow:0 8px 20px rgba(127,255,212,.22)}.btn2{background:#eafff8;color:#07342f}.danger{background:#ffd8d8;color:#5c1111}.hint{font-size:13px;line-height:1.55;color:#e8fffa;margin-top:13px}.ok{color:#b7ffd8}.bad{color:#ffe0e0}.msg{padding:12px;border-radius:13px;background:rgba(255,255,255,.14);margin:12px 0}.small{font-size:12px;color:#cdeee8;margin-top:12px}.netbox{margin-top:14px;padding:13px;border-radius:16px;background:rgba(0,0,0,.2)}.net{display:block;text-decoration:none;color:#08352f;background:#eafff8;border-radius:12px;padding:12px;margin-top:8px;font-weight:900}.net span{float:right;color:#456;font-weight:650;font-size:12px}.copy{font-family:ui-monospace,Consolas,monospace;background:rgba(0,0,0,.22);padding:2px 6px;border-radius:7px}.warnbox{background:rgba(255,197,66,.16);border:1px solid rgba(255,197,66,.35);padding:12px;border-radius:14px;margin-top:12px}.footer{padding:0 20px 18px}.mini{font-size:12px;opacity:.9}";
+  html += ".wrap{max-width:520px;margin:0 auto}.card{background:linear-gradient(145deg,rgba(7,107,93,.96),rgba(6,26,43,.96));border:1px solid rgba(255,255,255,.22);border-radius:22px;box-shadow:0 18px 45px rgba(0,0,0,.35);overflow:hidden}.top{padding:20px 20px 12px;border-bottom:1px solid rgba(255,255,255,.15)}h1{margin:0;font-size:27px}.sub{margin-top:8px;color:#d6fff6;font-size:14px;line-height:1.48}.body{padding:18px 20px}.step{display:flex;gap:10px;align-items:flex-start;margin:11px 0;padding:12px;border-radius:14px;background:rgba(255,255,255,.11)}.num{flex:0 0 28px;height:28px;border-radius:50%;background:#7fffd4;color:#07342f;font-weight:900;display:flex;align-items:center;justify-content:center}.txt{font-size:14px;line-height:1.45}.pill{display:inline-block;border:1px solid rgba(255,255,255,.35);border-radius:999px;padding:7px 10px;margin:0 5px 8px 0;font-size:13px;background:rgba(255,255,255,.1)}label{display:block;margin:14px 0 7px;font-weight:800}input{width:100%;box-sizing:border-box;border:0;border-radius:13px;padding:14px;font-size:17px;outline:none;background:#fff;color:#111}.row{display:grid;grid-template-columns:1fr;gap:10px}button,.btn{display:block;width:100%;box-sizing:border-box;text-align:center;text-decoration:none;margin-top:14px;border:0;border-radius:15px;padding:15px 16px;font-size:17px;font-weight:900;color:#08352f;background:#7fffd4;box-shadow:0 8px 20px rgba(127,255,212,.22)}.btn2{background:#eafff8;color:#07342f}.danger{background:#ffd8d8;color:#5c1111}.hint{font-size:13px;line-height:1.55;color:#e8fffa;margin-top:13px}.ok{color:#b7ffd8}.bad{color:#ffe0e0}.msg{padding:12px;border-radius:13px;background:rgba(255,255,255,.14);margin:12px 0}.small{font-size:12px;color:#cdeee8;margin-top:12px}.netbox{margin-top:14px;padding:13px;border-radius:16px;background:rgba(0,0,0,.2)}.net{display:block;text-decoration:none;color:#08352f;background:#eafff8;border-radius:12px;padding:12px;margin-top:8px;font-weight:900}.net span{float:right;color:#456;font-weight:650;font-size:12px}.goodnet{border-left:7px solid #3ee58f}.oknet{border-left:7px solid #9ee58f}.warnnet{border-left:7px solid #ffca42}.badnet{border-left:7px solid #ff5a5a}.blocked{opacity:.82}.recommend{padding:10px;border-radius:12px;background:rgba(127,255,212,.16);border:1px solid rgba(127,255,212,.28);font-size:13px;line-height:1.45}.force{display:flex;gap:10px;align-items:flex-start;margin-top:12px;padding:12px;border-radius:13px;background:rgba(255,197,66,.14);border:1px solid rgba(255,197,66,.35)}.force input{width:auto;margin-top:3px}.copy{font-family:ui-monospace,Consolas,monospace;background:rgba(0,0,0,.22);padding:2px 6px;border-radius:7px}.warnbox{background:rgba(255,197,66,.16);border:1px solid rgba(255,197,66,.35);padding:12px;border-radius:14px;margin-top:12px}.footer{padding:0 20px 18px}.mini{font-size:12px;opacity:.9}";
   html += "</style>";
   html += "<script>function pick(s){document.getElementById('ssid').value=s;document.getElementById('pass').focus();return false;} function togglePass(){var p=document.getElementById('pass');p.type=p.type==='password'?'text':'password';}</script>";
   html += "</head><body><div class='wrap'><main class='card'><section class='top'><h1>HP12 WiFi Setup</h1>";
@@ -1897,9 +2156,11 @@ String portalPageHtml(const String &message = "") {
   if (message.length()) { html += "<div class='msg'>"; html += message; html += "</div>"; }
   html += "<div class='warnbox'><b>Neu dien thoai bao khong co Internet:</b> chon <b>Van ket noi / Use without Internet / Keep WiFi connection</b>. Neu van bi day ra, tat tam 4G/5G roi mo lai <span class='copy'>http://192.168.4.1</span>.</div>";
   html += "<div class='step'><div class='num'>1</div><div class='txt'>Dien thoai phai dang ket noi vao <b>"; html += htmlEscape(apName); html += "</b>. Khong chuyen WiFi dien thoai sang WiFi moi.</div></div>";
-  html += "<div class='step'><div class='num'>2</div><div class='txt'>Bam ten WiFi 2.4GHz ben duoi, hoac go ten WiFi vao o SSID.</div></div>";
+  html += "<div class='step'><div class='num'>2</div><div class='txt'>Chon WiFi co song tot. Neu WiFi hien <b>QUA YEU</b>, HP12 se khong luu de tranh lap setup.</div></div>";
   html += "<div class='step'><div class='num'>3</div><div class='txt'>Nhap mat khau WiFi moi, bam <b>Luu & Ket noi</b>. HP12 se reboot va vao ThingsBoard lai.</div></div>";
+  html += "<div class='warnbox'><b>Location:</b> sau khi vao WiFi moi, HP12 tu cap nhat vi tri theo <b>public IP/router</b>. Day la vi tri gan dung theo mang, khong phai GPS.</div>";
   html += "<p class='hint'>Ly do mo portal: <b>"; html += htmlEscape(wifiPortalReason); html += "</b>. Loi gan nhat: <b>"; html += htmlEscape(wifiLastFailure); html += "</b>.</p>";
+  if (wifiPortalUserHint.length()) { html += "<div class='msg'>"; html += htmlEscape(wifiPortalUserHint); html += "</div>"; }
   String tokenStat = isNonEmptyTokenString(activeTbToken) ? (String("da co token, nguon: ") + activeTbTokenSource + String(", ") + tokenPreview(activeTbToken)) : String("chua co token");
   html += wifiPortalScanHtml;
   html += "<form method='POST' action='/save' autocomplete='off'><label>Ten WiFi moi / SSID</label><input id='ssid' name='ssid' required maxlength='32' placeholder='Vi du: FPT Telecom-20BD' value='";
@@ -1907,7 +2168,8 @@ String portalPageHtml(const String &message = "") {
   html += "'><label>Mat khau WiFi moi</label><input id='pass' name='pass' type='password' maxlength='64' placeholder='De trong neu WiFi open'><a class='btn btn2' href='#' onclick='togglePass();return false;'>Hien / an mat khau</a>";
   html += "<label>ThingsBoard Access Token HP12</label><input name='tbtoken' maxlength='80' placeholder='De trong neu khong doi token'>";
   html += "<p class='hint'>Trang thai token: <b>"; html += htmlEscape(tokenStat); html += "</b>. Doi WiFi khong xoa token ThingsBoard.</p>";
-  html += "<button type='submit'>Luu & Ket noi WiFi moi</button></form>";
+  html += "<div class='force'><input type='checkbox' name='forceWeak' value='1'><div class='txt'><b>Ky thuat vien:</b> van cho phep thu WiFi yeu. Nguoi dung binh thuong khong nen tick muc nay.</div></div>";
+  html += "<button type='submit'>Kiem tra song & Luu WiFi</button></form>";
   html += "<a class='btn btn2' href='/'>Tai lai danh sach WiFi</a>";
   html += "<p class='small'>Neu trang nay khong luu duoc, go truc tiep tren trinh duyet: <span class='copy'>http://192.168.4.1/save?ssid=TEN_WIFI&pass=MATKHAU</span></p>";
   html += "</section><section class='footer'><p class='mini'>HP12 chi luu SSID/mat khau trong bo nho ESP32. Khong dua secrets.h len GitHub.</p></section></main></div></body></html>";
@@ -1915,6 +2177,7 @@ String portalPageHtml(const String &message = "") {
 }
 
 void handlePortalRoot() {
+  wifiPortalStepText = "2 Chon WiFi 2.4G";
   Serial.print("[WiFiSetup] HTTP GET ");
   Serial.print(wifiServer.uri());
   Serial.print(" from ");
@@ -1960,6 +2223,28 @@ void handlePortalSave() {
     return;
   }
 
+  wifiPortalStepText = "3 Kiem tra WiFi";
+  wifiPortalCandidateRssiDbm = -999;
+#if WIFI_PORTAL_VALIDATE_SCAN_BEFORE_SAVE
+  wifiPortalCandidateRssiDbm = lookupPortalCachedRssiForSsid(ssid);
+  if (wifiPortalCandidateRssiDbm <= -998) {
+    // Fallback only when the user typed SSID manually and it was not in the latest portal list.
+    // Use AP+STA scan to keep the phone connected as much as possible.
+    wifiPortalCandidateRssiDbm = scanRssiForSetupCandidate(ssid);
+  }
+  bool forceWeak = wifiServer.hasArg("forceWeak") && wifiServer.arg("forceWeak") == "1";
+  if (wifiDoctorShouldBlockRssi(wifiPortalCandidateRssiDbm) && !forceWeak) {
+    wifiLastFailure = wifiPortalCandidateRssiDbm <= -998 ? "ssid-not-visible-2g-before-save" : "wifi-too-weak-for-esp32";
+    wifiPortalStepText = "WiFi qua yeu";
+    wifiPortalUserHint = String("WiFi ") + ssid + String(" dang ") + String(wifiPortalCandidateRssiDbm) + String(" dBm - ") + wifiDoctorRssiLabel(wifiPortalCandidateRssiDbm) + String(". ") + wifiDoctorHumanAdvice(wifiPortalCandidateRssiDbm);
+    Serial.print("[WiFiDoctor] BLOCK save. ");
+    Serial.println(wifiPortalUserHint);
+    wifiServer.send(200, "text/html; charset=utf-8", portalPageHtml(String("<span class='bad'>Khong luu WiFi nay: ") + htmlEscape(wifiPortalUserHint) + String("</span>")));
+    return;
+  }
+  wifiPortalUserHint = String("WiFi ") + ssid + String(" = ") + String(wifiPortalCandidateRssiDbm) + String(" dBm - ") + wifiDoctorRssiLabel(wifiPortalCandidateRssiDbm) + String(". ") + wifiDoctorHumanAdvice(wifiPortalCandidateRssiDbm);
+#endif
+
   saveWifiCredentials(ssid, pass);
   if (tbtoken.length() > 0) {
     if (isNonEmptyTokenString(tbtoken)) {
@@ -1970,10 +2255,11 @@ void handlePortalSave() {
       return;
     }
   }
+  wifiPortalStepText = "Da luu - reboot";
   Serial.print("[WiFiSetup] Saved new WiFi: ");
   Serial.println(ssid);
 
-  wifiServer.send(200, "text/html; charset=utf-8", portalPageHtml("<span class='ok'>Da luu WiFi/Token. HP12 se tu khoi dong lai de ket noi ThingsBoard.</span>"));
+  wifiServer.send(200, "text/html; charset=utf-8", portalPageHtml("<span class='ok'>Da luu WiFi/Token. HP12 se tu khoi dong lai. Neu van fail, hay chon WiFi co RSSI manh hon -75 dBm.</span>"));
   scheduledRestartAtMs = millis() + WIFI_SETUP_RESTART_MS;
 }
 
@@ -1996,6 +2282,9 @@ void startWifiSetupPortal(const char* reason) {
   wifiPortalActive = true;
   wifiPortalReason = String(reason ? reason : "unknown");
   wifiPortalStartedMs = millis();
+  wifiPortalStepText = "1 Ket noi dien thoai";
+  wifiPortalUserHint = "";
+  wifiPortalCandidateRssiDbm = -999;
   wifiConnectStartedMs = 0;
   lastWifiRetryMs = 0;
   wifiConnectAnnounced = false;
@@ -2095,7 +2384,10 @@ void updateWifiSetupPortalNonBlocking() {
     Serial.print(" | IP=");
     Serial.println(WiFi.softAPIP());
     if (stations == 0) {
+      wifiPortalStepText = "Cho dien thoai vao AP";
       Serial.println("[WiFiSetup] Phone not connected yet. On phone: connect to HP12-SETUP AP, keep connection without Internet, open http://192.168.4.1");
+    } else if (wifiPortalStepText.length() == 0 || wifiPortalStepText.startsWith("Cho ") || wifiPortalStepText.startsWith("1 ")) {
+      wifiPortalStepText = "Mo 192.168.4.1";
     }
   }
 }
@@ -2304,6 +2596,7 @@ bool commitLocationFromJson(const String &body, const char* provider) {
   locationSource = "ip";
   locationFetchStatus = "success";
   locationFetched = true;
+  locationLastSuccessMs = millis();
 
   // Vị trí là dữ liệu động theo WiFi/IP nên phải gửi lại attributes/telemetry.
   attributesSentOnce = false;
@@ -2512,7 +2805,7 @@ void updateWiFiNonBlocking() {
       wifiConnectStartedMs = 0;
       wifiTimeoutCount = 0;
       wifiLastFailure = "none";
-      wifiLastStatusText = "CONNECTED";
+      wifiLastStatusText = String("CONNECTED:") + WiFi.SSID();
       mqttFirstAttemptAfterWifi = false;
       lastMqttRetryMs = 0;
       forceFirstTelemetry = FORCE_FIRST_SYNC_ENABLED;
@@ -2613,6 +2906,11 @@ void sendDeviceAttributes() {
   jsonAddString(payload, first, "firmwareVersion", FIRMWARE_VERSION);
   jsonAddString(payload, first, "ipAddress", WiFi.localIP().toString());
   jsonAddString(payload, first, "macAddress", WiFi.macAddress());
+  jsonAddString(payload, first, "wifiConnectedSsid", WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String(""));
+  jsonAddString(payload, first, "wifiConnectedBssid", wifiConnectedBssidText());
+  jsonAddString(payload, first, "wifiGateway", WiFi.status() == WL_CONNECTED ? WiFi.gatewayIP().toString() : String(""));
+  jsonAddInt(payload, first, "wifiRssi", WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -999);
+  jsonAddString(payload, first, "wifiQualityText", wifiQualityText());
   jsonAddString(payload, first, "resetReason", resetReasonText(esp_reset_reason()));
   jsonAddBool(payload, first, "lightSensorEnabled", LIGHT_SENSOR_ENABLED);
   jsonAddInt(payload, first, "dhtPin", DHT_PIN);
@@ -2632,6 +2930,11 @@ void sendDeviceAttributes() {
   jsonAddString(payload, first, "locationSource", locationSource);
   jsonAddString(payload, first, "locationProvider", locationProvider);
   jsonAddString(payload, first, "locationFetchStatus", locationFetchStatus);
+  jsonAddString(payload, first, "locationBasis", "public-ip-from-current-wifi");
+  jsonAddString(payload, first, "locationConfidence", locationConfidenceText());
+  jsonAddString(payload, first, "locationSummary", locationSummaryText());
+  jsonAddString(payload, first, "locationWifiSsid", WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String(""));
+  jsonAddInt(payload, first, "locationLastSuccessSec", locationLastSuccessMs / 1000);
   payload += "}";
 
   bool ok = mqttClient.publish("v1/devices/me/attributes", payload.c_str());
@@ -2679,6 +2982,9 @@ String buildTelemetryPayload() {
   jsonAddInt(payload, first, "wifiSignalQuality", wifiSignalQualityPercent());
   jsonAddString(payload, first, "wifiQualityText", wifiQualityText());
   jsonAddString(payload, first, "wifiStatus", WiFi.status() == WL_CONNECTED ? String("CONNECTED") : String(wifiLastStatusText));
+  jsonAddString(payload, first, "wifiConnectedSsid", WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String(""));
+  jsonAddString(payload, first, "wifiConnectedBssid", wifiConnectedBssidText());
+  jsonAddString(payload, first, "wifiGateway", WiFi.status() == WL_CONNECTED ? WiFi.gatewayIP().toString() : String(""));
   jsonAddInt(payload, first, "wifiBestScanRssi", wifiLastBestRssiDbm);
   jsonAddString(payload, first, "wifiLastScan", wifiLastScanSummary);
   jsonAddString(payload, first, "wifiSsid", WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String(""));
@@ -2698,6 +3004,11 @@ String buildTelemetryPayload() {
   jsonAddString(payload, first, "locationSource", locationSource);
   jsonAddString(payload, first, "locationProvider", locationProvider);
   jsonAddString(payload, first, "locationFetchStatus", locationFetchStatus);
+  jsonAddString(payload, first, "locationBasis", "public-ip-from-current-wifi");
+  jsonAddString(payload, first, "locationConfidence", locationConfidenceText());
+  jsonAddString(payload, first, "locationSummary", locationSummaryText());
+  jsonAddString(payload, first, "locationWifiSsid", WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String(""));
+  jsonAddInt(payload, first, "locationLastSuccessSec", locationLastSuccessMs / 1000);
   jsonAddInt(payload, first, "freeHeap", ESP.getFreeHeap());
 
   payload += "}";
@@ -2724,11 +3035,17 @@ String buildStatusJson() {
   jsonAddInt(payload, first, "wifiSignalQuality", wifiSignalQualityPercent());
   jsonAddString(payload, first, "wifiQualityText", wifiQualityText());
   jsonAddString(payload, first, "wifiStatus", WiFi.status() == WL_CONNECTED ? String("CONNECTED") : String(wifiLastStatusText));
+  jsonAddString(payload, first, "wifiConnectedSsid", WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String(""));
+  jsonAddString(payload, first, "wifiConnectedBssid", wifiConnectedBssidText());
+  jsonAddString(payload, first, "wifiGateway", WiFi.status() == WL_CONNECTED ? WiFi.gatewayIP().toString() : String(""));
   jsonAddInt(payload, first, "wifiBestScanRssi", wifiLastBestRssiDbm);
   jsonAddString(payload, first, "wifiLastScan", wifiLastScanSummary);
   jsonAddString(payload, first, "locationSource", locationSource);
   jsonAddString(payload, first, "locationProvider", locationProvider);
   jsonAddString(payload, first, "locationFetchStatus", locationFetchStatus);
+  jsonAddString(payload, first, "locationBasis", "public-ip-from-current-wifi");
+  jsonAddString(payload, first, "locationConfidence", locationConfidenceText());
+  jsonAddString(payload, first, "locationSummary", locationSummaryText());
   jsonAddFloat(payload, first, "latitude", latitude, 6, !isnan(latitude));
   jsonAddFloat(payload, first, "longitude", longitude, 6, !isnan(longitude));
   payload += "}";
@@ -3466,18 +3783,18 @@ void setup() {
   Serial.println("Basis: Temp + RH + Heat Index + relative light; proxy only.");
   Serial.println("Cloud: WiFi + MQTT ThingsBoard non-blocking, anti-spam telemetry.");
   Serial.println("WiFi setup: Preferences memory + HP12-SETUP portal if boot WiFi fails.");
-  Serial.println("Hold NAV + ADVICE for 5.5s to open HP12-SETUP; fallback: hold NAV or ADVICE alone for 8.5s.");
+  Serial.println("Hold NAV + ADVICE for 5.5s to open HP12-SETUP; single-button fallback is disabled to protect OLED button UX.");
   Serial.println("Serial command: type SETUP then Enter to force HP12-SETUP from Arduino Serial Monitor.");
   Serial.println("WiFi fix: stop STA before AP portal; after online, retry STA forever on drops.");
   Serial.println("LOC: dynamic IP-location enabled; retries across providers, refreshes on WiFi change.");
   Serial.println("WiFi hardening: VN country ch1-13, scan-before-connect, fast portal if saved SSID is absent.");
   Serial.println("MQTT fix: restored ThingsBoard credential path; immediate connect after WiFi; explicit token/rc diagnostics.");
-  Serial.println("OTA fix v1.13.16: RPC OTA restored + OTA-safe WiFi boot after remote update; GitHub redirects supported.");
+  Serial.println("OTA fix retained: RPC OTA restored + OTA-safe WiFi boot after remote update; GitHub redirects supported.");
   Serial.println("OTA-safe WiFi: after OTA reboot, suppress auto setup portal during grace window; try saved WiFi first even if RSSI is weak.");
   Serial.println("Credential fix: token can come from Preferences or local secrets.h; no factory token embedded.");
-  Serial.println("Portal fix: phone captive portal AP-only, scan-list, GET/POST save for WiFi and ThingsBoard token.");
+  Serial.println("WiFi UX v1.13.19: OLED shows connected SSID/RSSI/IP/location status; portal explains IP-location basis.");
   Serial.println("Serial fallback: type SETWIFI=YourSSID|YourPassword then Enter to change WiFi without portal.");
-  Serial.println("WiFi setup robust v1.13.16: phone-first portal + OTA-safe boot; weak RSSI no longer traps OTA reboot in setup loop.");
+  Serial.println("Button UX fix v1.13.17: short NAV/ADVICE clicks work again; setup hold no longer consumes normal OLED tab control.");
   printMqttTokenHint(true);
   Serial.println("====================================");
 }
